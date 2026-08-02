@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-08-02
+
+### Changed
+
+- Removed pre-release status language from the public README and clarified the
+  architecture, installation, and product-roadmap wording.
+- Synchronized package, API, OpenAPI, test-fixture, and release-documentation
+  metadata for the `0.3.1` patch release.
+- Changed npm publication to use the already checked and attested release
+  tarball, keeping the npm and GitHub package artifacts byte-identical.
+
 ## [0.3.0] - 2026-08-02
 
 ### Added

@@ -38,11 +38,11 @@ Run local storage and S3-compatible storage as separate release gates:
 export E2E_FIXTURE_ROOT=/absolute/path/to/marked-disposable-fixture
 
 scripts/e2e/run-packed-e2e.sh \
-  --tarball /absolute/path/to/makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz \
+  --tarball /absolute/path/to/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz \
   --storage local
 
 scripts/e2e/run-packed-e2e.sh \
-  --tarball /absolute/path/to/makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz \
+  --tarball /absolute/path/to/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz \
   --storage s3
 ```
 
