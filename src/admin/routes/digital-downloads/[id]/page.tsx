@@ -274,7 +274,9 @@ const DigitalDownloadDetailPage = () => {
                   Version files safely and decide which release customers receive.
                 </Text>
               </div>
-              <Badge size="xsmall">{releases.length} releases</Badge>
+              <Badge size="xsmall">
+                {releases.length} {releases.length === 1 ? "release" : "releases"}
+              </Badge>
             </div>
             {!releases.length ? (
               <EmptyState

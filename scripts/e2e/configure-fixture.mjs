@@ -19,7 +19,7 @@ import { homedir } from "node:os"
 import path from "node:path"
 
 const PLUGIN_NAME = "@makecrypto/medusa-plugin-digital-downloads"
-const EXPECTED_VERSION = "0.3.1"
+const EXPECTED_VERSION = "0.3.2"
 const FIXTURE_ROOT_INPUT = process.env.E2E_FIXTURE_ROOT?.trim()
 if (!FIXTURE_ROOT_INPUT || !path.isAbsolute(FIXTURE_ROOT_INPUT)) {
   throw new Error("E2E_FIXTURE_ROOT must be an absolute disposable fixture path")
@@ -348,7 +348,7 @@ async function installTarball(tarball) {
       typeof storefrontExports.createDigitalDownloadsFetchClient !== "function" ||
       typeof storefrontExports.MakePayAttribution !== "function"
     ) {
-      fail("The packed storefront export is missing or does not match v0.3.1")
+      fail(`The packed storefront export is missing or does not match v${EXPECTED_VERSION}`)
     }
   }
 }

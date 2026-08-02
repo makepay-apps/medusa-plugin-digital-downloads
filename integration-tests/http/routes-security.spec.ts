@@ -100,7 +100,7 @@ medusaIntegrationTestRunner({
         expect(response.status).toBe(200)
         expect(response.data.plugin).toMatchObject({
           id: "medusa-plugin-digital-downloads",
-          version: "0.3.1",
+          version: "0.3.2",
           attribution: {
             text: "Brought to you by MakePay.io — crypto payment gateway.",
             url: "https://makepay.io",

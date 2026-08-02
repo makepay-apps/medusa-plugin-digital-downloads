@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: Medusa Digital Downloads API
-  version: 0.3.1
+  version: 0.3.2
   summary: Native Medusa v2 APIs for protected digital delivery and licensing.
   description: |
     Admin catalog, storage, entitlement, audit, and reporting APIs plus Store APIs
@@ -1954,7 +1954,7 @@ components:
           const: Digital Downloads
         version:
           type: string
-          const: 0.3.1
+          const: 0.3.2
         api_version:
           type: string
           const: "1"

@@ -24,6 +24,8 @@ capabilities, or plaintext license keys.
 Open **Digital Downloads** in the Medusa sidebar. The `/digital-downloads`
 overview provides:
 
+![Medusa Admin Digital Downloads overview showing metrics, filters, and product configurations](images/admin-digital-downloads-overview.jpg)
+
 - active digital product count;
 - active entitlement count;
 - download activity over the last 30 days;
@@ -53,6 +55,8 @@ The product widget appears in the `product.details.after` zone and lists current
 digital configurations, associated variant count, delivery type, active
 release, asset count, license-policy label, and status.
 
+![Digital delivery widget embedded in a Medusa product detail page](images/admin-product-widget.jpg)
+
 The create/edit form supports:
 
 - one Medusa product and one or more of its variants;
@@ -76,6 +80,8 @@ select or enter that policy for the digital configuration.
 ## Configuration detail
 
 Open a row at `/digital-downloads/:id`. The page displays:
+
+![Digital product configuration showing delivery policy and the published release](images/admin-digital-product-configuration.jpg)
 
 - delivery and fulfillment policy;
 - download limit and access expiry;
@@ -171,6 +177,8 @@ order has digital entitlement data or is still loading it. It shows:
 The widget intentionally omits signed URLs, raw grants, guest tokens, storage
 locations, encrypted values, and plaintext license keys.
 
+![Digital fulfillment widget embedded in a Medusa order detail page](images/admin-order-fulfillment.jpg)
+
 ## License management
 
 Open `/digital-downloads/licenses` from the overview. The page provides:
@@ -205,6 +213,8 @@ lease-verification flow is shipped.
 
 Open `/digital-downloads/settings` from the overview. The shipped screen
 contains two groups.
+
+![Digital download settings showing fulfillment controls and safe deployment diagnostics](images/admin-digital-download-settings.jpg)
 
 ### Deployment diagnostics
 
