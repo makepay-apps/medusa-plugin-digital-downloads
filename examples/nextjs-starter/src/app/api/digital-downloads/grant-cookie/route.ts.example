@@ -1,0 +1,148 @@
+import { NextRequest, NextResponse } from "next/server"
+
+export const dynamic = "force-dynamic"
+export const runtime = "nodejs"
+
+const MAX_GRANT_COOKIE_BODY_BYTES = 8 * 1024
+
+type GrantCookieRequest = {
+  token?: unknown
+  asset_id?: unknown
+  expires_at?: unknown
+}
+
+class RequestBodyError extends Error {
+  constructor(
+    readonly status: 400 | 413,
+    message: string
+  ) {
+    super(message)
+    this.name = "RequestBodyError"
+  }
+}
+
+async function cancelBody(body: ReadableStream<Uint8Array> | null): Promise<void> {
+  if (!body) return
+
+  try {
+    await body.cancel("Request body rejected.")
+  } catch {
+    // The server may already have closed or locked the incoming stream.
+  }
+}
+
+async function readLimitedBody(request: NextRequest): Promise<Uint8Array> {
+  const declaredLength = request.headers.get("content-length")
+  if (declaredLength !== null) {
+    const normalizedLength = declaredLength.trim()
+    if (!/^\d+$/.test(normalizedLength)) {
+      await cancelBody(request.body)
+      throw new RequestBodyError(400, "Invalid Content-Length header.")
+    }
+
+    const declaredBytes = Number(normalizedLength)
+    if (
+      !Number.isSafeInteger(declaredBytes) ||
+      declaredBytes > MAX_GRANT_COOKIE_BODY_BYTES
+    ) {
+      await cancelBody(request.body)
+      throw new RequestBodyError(413, "Request body too large.")
+    }
+  }
+
+  if (!request.body) return new Uint8Array()
+
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      if (totalBytes + value.byteLength > MAX_GRANT_COOKIE_BODY_BYTES) {
+        try {
+          await reader.cancel("Request body too large.")
+        } catch {
+          // The connection can close before cancellation completes.
+        }
+        throw new RequestBodyError(413, "Request body too large.")
+      }
+
+      chunks.push(value)
+      totalBytes += value.byteLength
+    }
+  } catch (error) {
+    if (!(error instanceof RequestBodyError)) {
+      try {
+        await reader.cancel("Unable to read request body.")
+      } catch {
+        // The connection can close before cancellation completes.
+      }
+    }
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+
+  const body = new Uint8Array(totalBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return body
+}
+
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  if (request.headers.get("origin") !== request.nextUrl.origin) {
+    return NextResponse.json({ message: "Invalid origin." }, { status: 403 })
+  }
+
+  let input: GrantCookieRequest
+  try {
+    const rawInput: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(await readLimitedBody(request))
+    )
+    if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+      throw new SyntaxError("Expected a JSON object.")
+    }
+    input = rawInput as GrantCookieRequest
+  } catch (error) {
+    if (error instanceof RequestBodyError && error.status === 413) {
+      return NextResponse.json({ message: "Request body too large." }, { status: 413 })
+    }
+    return NextResponse.json({ message: "Malformed JSON body." }, { status: 400 })
+  }
+
+  if (
+    typeof input.token !== "string" ||
+    input.token.length < 32 ||
+    input.token.length > 2048 ||
+    typeof input.asset_id !== "string" ||
+    !/^[A-Za-z0-9_-]{1,160}$/.test(input.asset_id) ||
+    typeof input.expires_at !== "string"
+  ) {
+    return NextResponse.json({ message: "Invalid content grant." }, { status: 400 })
+  }
+
+  const expiresAt = Date.parse(input.expires_at)
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    return NextResponse.json({ message: "The content grant has expired." }, { status: 410 })
+  }
+
+  const maxAge = Math.max(1, Math.min(900, Math.floor((expiresAt - Date.now()) / 1000)))
+  const contentPath = `/api/digital-downloads/content/${input.asset_id}`
+  const response = NextResponse.json({ url: contentPath })
+  response.headers.set("cache-control", "private, no-store")
+  response.headers.set("referrer-policy", "no-referrer")
+  response.cookies.set(`mp_dd_grant_${input.asset_id}`, input.token, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV === "production",
+    path: contentPath,
+    maxAge,
+  })
+  return response
+}

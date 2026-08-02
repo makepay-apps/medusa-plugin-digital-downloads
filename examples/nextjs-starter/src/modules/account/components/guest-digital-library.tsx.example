@@ -1,0 +1,66 @@
+"use client"
+
+import {
+  DigitalLibrary,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+import { useEffect, useId, useState, type FormEvent } from "react"
+import { openProtectedContent } from "./digital-library"
+
+export function GuestDigitalLibrary() {
+  const [token, setToken] = useState<string>()
+  const [email, setEmail] = useState("")
+  const [guestEmail, setGuestEmail] = useState<string>()
+  const emailId = useId()
+
+  useEffect(() => {
+    const fragment = new URLSearchParams(window.location.hash.slice(1))
+    const capability = fragment.get("token")
+    if (capability) {
+      window.history.replaceState(window.history.state, "", window.location.pathname)
+      setToken(capability)
+    }
+  }, [])
+
+  if (!token) {
+    return <p role="status">This access link is missing or invalid.</p>
+  }
+
+  if (!guestEmail) {
+    const submitEmail = (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      const normalized = email.trim()
+      if (normalized) setGuestEmail(normalized)
+    }
+
+    return (
+      <form onSubmit={submitEmail}>
+        <h2>Access your protected purchase</h2>
+        <p>Enter the email address used for this order.</p>
+        <label htmlFor={emailId}>Order email</label>
+        <input
+          autoComplete="email"
+          id={emailId}
+          maxLength={320}
+          onChange={(event) => setEmail(event.currentTarget.value)}
+          required
+          type="email"
+          value={email}
+        />
+        <button type="submit">Continue</button>
+      </form>
+    )
+  }
+
+  return (
+    <>
+      <button onClick={() => setGuestEmail(undefined)} type="button">
+        Use a different order email
+      </button>
+      <DigitalLibrary
+        access={{ guest_token: token, guest_email: guestEmail }}
+        heading="Your protected purchase"
+        onGrant={openProtectedContent}
+      />
+    </>
+  )
+}

@@ -1,0 +1,33 @@
+"use client"
+
+import {
+  DigitalDownloadsProvider,
+  createDigitalDownloadsFetchClient,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+import { useMemo, type PropsWithChildren } from "react"
+
+export function StorefrontDigitalDownloadsProvider({
+  children,
+  identityKey,
+}: PropsWithChildren<{ identityKey?: string }>) {
+  const storefrontBaseUrl = process.env.NEXT_PUBLIC_BASE_URL
+  const client = useMemo(
+    () => {
+      if (!storefrontBaseUrl) {
+        throw new Error("NEXT_PUBLIC_BASE_URL is required for digital downloads")
+      }
+      return createDigitalDownloadsFetchClient({
+        // The BFF reads the official starter's HttpOnly _medusa_jwt cookie.
+        baseUrl: storefrontBaseUrl,
+        pathPrefix: "/api/digital-downloads",
+      })
+    },
+    [storefrontBaseUrl]
+  )
+
+  return (
+    <DigitalDownloadsProvider client={client} identityKey={identityKey}>
+      {children}
+    </DigitalDownloadsProvider>
+  )
+}

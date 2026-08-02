@@ -1,0 +1,46 @@
+{
+  "title": "Digital Downloads",
+  "overview": {
+    "description": "Manage protected files, release versions, streaming, licenses, and customer access.",
+    "configurations": "Product configurations",
+    "configurationsDescription": "Connect Medusa variants to native digital fulfillment.",
+    "archived": "Selected configurations archived."
+  },
+  "metrics": {
+    "activeProducts": "Active products",
+    "activeEntitlements": "Active entitlements",
+    "downloads30d": "Downloads (30 days)",
+    "storage": "Storage used"
+  },
+  "actions": {
+    "settings": "Settings",
+    "create": "Create digital product",
+    "clearFilters": "Clear filters",
+    "archiveSelected": "Archive selected ({{count}})"
+  },
+  "filters": {
+    "search": "Search configurations",
+    "status": "Status",
+    "delivery": "Delivery type",
+    "allStatuses": "All statuses",
+    "allDeliveryTypes": "All delivery types"
+  },
+  "status": {
+    "active": "Active",
+    "draft": "Draft",
+    "inactive": "Inactive",
+    "archived": "Archived"
+  },
+  "delivery": {
+    "download": "Protected download",
+    "license": "License key",
+    "downloadAndLicense": "Download and license",
+    "stream": "Protected stream"
+  },
+  "empty": {
+    "title": "No digital products yet",
+    "description": "Create a configuration to associate Medusa variants with protected digital fulfillment.",
+    "filteredTitle": "No matching configurations",
+    "filteredDescription": "Try removing one or more filters."
+  }
+}

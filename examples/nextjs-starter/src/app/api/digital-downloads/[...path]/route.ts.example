@@ -1,0 +1,189 @@
+import { NextRequest } from "next/server"
+
+export const dynamic = "force-dynamic"
+export const runtime = "nodejs"
+
+const MAX_PROXY_BODY_BYTES = 64 * 1024
+
+const ALLOWED_ROOTS = new Set([
+  "content",
+  "entitlements",
+  "guest",
+  "library",
+  "licenses",
+  "previews",
+  "products",
+])
+
+const RESPONSE_HEADERS = [
+  "accept-ranges",
+  "cache-control",
+  "content-disposition",
+  "content-length",
+  "content-range",
+  "content-type",
+  "etag",
+  "last-modified",
+  "retry-after",
+  "x-request-id",
+]
+
+type RouteContext = { params: Promise<{ path: string[] }> }
+
+class RequestBodyError extends Error {
+  constructor(
+    readonly status: 400 | 413,
+    message: string
+  ) {
+    super(message)
+    this.name = "RequestBodyError"
+  }
+}
+
+async function cancelBody(body: ReadableStream<Uint8Array> | null): Promise<void> {
+  if (!body) return
+
+  try {
+    await body.cancel("Request body rejected.")
+  } catch {
+    // The server may already have closed or locked the incoming stream.
+  }
+}
+
+async function readLimitedBody(request: NextRequest): Promise<Uint8Array> {
+  const declaredLength = request.headers.get("content-length")
+  if (declaredLength !== null) {
+    const normalizedLength = declaredLength.trim()
+    if (!/^\d+$/.test(normalizedLength)) {
+      await cancelBody(request.body)
+      throw new RequestBodyError(400, "Invalid Content-Length header.")
+    }
+
+    const declaredBytes = Number(normalizedLength)
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > MAX_PROXY_BODY_BYTES) {
+      await cancelBody(request.body)
+      throw new RequestBodyError(413, "Request body too large.")
+    }
+  }
+
+  if (!request.body) return new Uint8Array()
+
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      if (totalBytes + value.byteLength > MAX_PROXY_BODY_BYTES) {
+        try {
+          await reader.cancel("Request body too large.")
+        } catch {
+          // The connection can close before cancellation completes.
+        }
+        throw new RequestBodyError(413, "Request body too large.")
+      }
+
+      chunks.push(value)
+      totalBytes += value.byteLength
+    }
+  } catch (error) {
+    if (!(error instanceof RequestBodyError)) {
+      try {
+        await reader.cancel("Unable to read request body.")
+      } catch {
+        // The connection can close before cancellation completes.
+      }
+    }
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+
+  const body = new Uint8Array(totalBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return body
+}
+
+async function proxy(request: NextRequest, context: RouteContext): Promise<Response> {
+  const { path } = await context.params
+  if (!path.length || !ALLOWED_ROOTS.has(path[0])) {
+    return Response.json({ message: "Not found." }, { status: 404 })
+  }
+
+  const backend = process.env.MEDUSA_BACKEND_URL
+  if (!backend) {
+    return Response.json({ message: "Medusa backend is not configured." }, { status: 500 })
+  }
+
+  const target = new URL(
+    `/store/digital-downloads/${path.map(encodeURIComponent).join("/")}`,
+    backend
+  )
+  request.nextUrl.searchParams.forEach((value, key) => target.searchParams.append(key, value))
+
+  const headers = new Headers({ accept: request.headers.get("accept") ?? "application/json" })
+  const contentType = request.headers.get("content-type")
+  const idempotencyKey = request.headers.get("idempotency-key")
+  const range = request.headers.get("range")
+  const publishableKey = process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY
+  if (contentType) headers.set("content-type", contentType)
+  if (idempotencyKey) headers.set("idempotency-key", idempotencyKey)
+  if (range) headers.set("range", range)
+  if (publishableKey) headers.set("x-publishable-api-key", publishableKey)
+
+  if (path[0] === "content" && path[1]) {
+    const cookieToken = request.cookies.get(`mp_dd_grant_${path[1]}`)?.value
+    const bearer = cookieToken
+      ? `Bearer ${cookieToken}`
+      : request.headers.get("authorization")
+    if (bearer) headers.set("authorization", bearer)
+  } else {
+    const customerJwt = request.cookies.get("_medusa_jwt")?.value
+    if (customerJwt) headers.set("authorization", `Bearer ${customerJwt}`)
+  }
+
+  let body: Uint8Array | undefined
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    try {
+      body = await readLimitedBody(request)
+    } catch (error) {
+      const status = error instanceof RequestBodyError ? error.status : 400
+      return Response.json(
+        { message: status === 413 ? "Request body too large." : "Invalid request body." },
+        { status }
+      )
+    }
+  }
+
+  const upstream = await fetch(target, {
+    method: request.method,
+    headers,
+    body,
+    cache: "no-store",
+    redirect: "manual",
+  })
+
+  const responseHeaders = new Headers()
+  for (const name of RESPONSE_HEADERS) {
+    const value = upstream.headers.get(name)
+    if (value) responseHeaders.set(name, value)
+  }
+  responseHeaders.set("cache-control", "private, no-store")
+  responseHeaders.set("x-content-type-options", "nosniff")
+  responseHeaders.set("referrer-policy", "no-referrer")
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: responseHeaders,
+  })
+}
+
+export const GET = proxy
+export const POST = proxy

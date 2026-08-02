@@ -1,0 +1,10 @@
+.medusa/server/**/__tests__/
+.medusa/server/**/*.spec.js
+.medusa/server/**/*.spec.js.map
+.medusa/server/integration-tests/
+.medusa/server/scripts/
+.medusa/server/tests/
+coverage/
+output/
+test-results/
+*.tgz

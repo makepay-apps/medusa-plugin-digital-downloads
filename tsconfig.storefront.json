@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "declarationMap": false,
+    "emitDeclarationOnly": true,
+    "inlineSourceMap": false,
+    "noEmit": false,
+    "outDir": ".medusa/server/src/storefront",
+    "rootDir": "src/storefront"
+  },
+  "include": ["src/storefront/**/*.ts", "src/storefront/**/*.tsx"],
+  "exclude": ["src/storefront/**/__tests__"]
+}
