@@ -1,0 +1,37 @@
+"use server"
+
+import {
+  createDigitalDownloadsClient,
+  createMedusaSdkTransport,
+  type DigitalGuestAccessRequest,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+import { sdk } from "@lib/config"
+import { getAuthHeaders } from "@lib/data/cookies"
+
+const serverClient = () =>
+  createDigitalDownloadsClient({
+    transport: createMedusaSdkTransport(sdk.client, {
+      // Resolved on every call, so one module-level client never captures a
+      // different request's JWT.
+      headers: getAuthHeaders,
+    }),
+  })
+
+export async function listDigitalLibrary(limit = 20, offset = 0) {
+  return serverClient().listLibrary({ limit, offset })
+}
+
+export async function retrieveDigitalEntitlement(id: string) {
+  return serverClient().getEntitlement(id)
+}
+
+export async function retrieveDigitalProductPreview(variantId: string) {
+  return serverClient().getProductPreview(variantId)
+}
+
+// Call this only from a server route/action. `input.email` is required by the
+// default order-email-match policy. Do not return the guest capability in a
+// React Server Component payload.
+export async function retrieveGuestDigitalPurchase(input: DigitalGuestAccessRequest) {
+  return serverClient().getGuestAccess(input)
+}

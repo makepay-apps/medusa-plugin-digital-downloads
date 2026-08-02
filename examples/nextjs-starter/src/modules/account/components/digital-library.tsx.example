@@ -1,0 +1,36 @@
+"use client"
+
+import {
+  DigitalLibrary,
+  DigitalAccessGrant,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+
+export async function openProtectedContent(grant: DigitalAccessGrant): Promise<void> {
+  const response = await fetch("/api/digital-downloads/grant-cookie", {
+    method: "POST",
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      token: grant.token,
+      asset_id: grant.asset_id,
+      expires_at: grant.expires_at,
+    }),
+  })
+  if (!response.ok) throw new Error("Unable to prepare protected content.")
+
+  const { url } = (await response.json()) as { url: string }
+  // The URL contains no secret. The browser sends a path-scoped HttpOnly cookie,
+  // including on subsequent audio/video byte-range requests.
+  window.location.assign(url)
+}
+
+export function AccountDigitalLibrary({ identityKey }: { identityKey: string }) {
+  return (
+    <DigitalLibrary
+      heading="Downloads & licenses"
+      identityKey={identityKey}
+      onGrant={openProtectedContent}
+    />
+  )
+}

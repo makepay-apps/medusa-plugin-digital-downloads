@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: medusa_digital_downloads_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/medusa_digital_downloads_test
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: medusa_digital_downloads_test
+      JWT_SECRET: integration-test-secret
+      COOKIE_SECRET: integration-test-secret
+      DIGITAL_DOWNLOADS_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify tagged commit is reachable from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_ref="refs/remotes/origin/main"
+          tagged_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          git fetch --force --no-tags --prune origin \
+            "refs/heads/main:${main_ref}"
+          if ! git merge-base --is-ancestor "$tagged_commit" "$main_ref"; then
+            echo "::error::Release tag commit $tagged_commit is not reachable from origin/main."
+            exit 1
+          fi
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Detect npm publishing credentials
+        id: npm-auth
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -n "$NPM_TOKEN" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Verify tag and package version match
+        shell: bash
+        run: test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")"
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev
+      - run: npm run check
+      - run: npm run test:integration:modules
+      - run: npm run test:integration:http
+      - name: Create package artifact, checksum, and SBOM
+        id: package
+        shell: bash
+        run: |
+          package_file="makecrypto-medusa-plugin-digital-downloads-${GITHUB_REF_NAME#v}.tgz"
+          npm pack
+          test -f "$package_file"
+          shasum -a 256 "$package_file" > "$package_file.sha256"
+          npx --no-install cyclonedx-npm \
+            --package-lock-only \
+            --omit dev \
+            --output-reproducible \
+            --validate \
+            --mc-type library \
+            --spec-version 1.6 \
+            --output-format JSON \
+            --output-file "$package_file.sbom.cdx.json"
+          node scripts/verify-sbom.mjs "$package_file.sbom.cdx.json"
+          echo "file=$package_file" >> "$GITHUB_OUTPUT"
+      - name: Attest package provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ steps.package.outputs.file }}
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.file }}
+            ${{ steps.package.outputs.file }}.sha256
+            ${{ steps.package.outputs.file }}.sbom.cdx.json
+      - name: Publish to npm when configured
+        if: ${{ steps.npm-auth.outputs.configured == 'true' }}
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,14 @@
+"use client"
+
+import {
+  DigitalProductPreviews,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+
+export function ProductDigitalPreviews({ variantId }: { variantId: string }) {
+  return (
+    <DigitalProductPreviews
+      heading="Listen, watch, or read a sample"
+      variantId={variantId}
+    />
+  )
+}
