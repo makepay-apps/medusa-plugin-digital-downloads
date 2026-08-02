@@ -10,21 +10,16 @@ by the plugin or explicitly passed from `medusa-config.ts`.
 
 ## Install and register
 
-From the Medusa backend application, install the exact released version from
-npm:
+From the Medusa backend application, install from npm:
 
 ```bash
-npm install @makecrypto/medusa-plugin-digital-downloads@0.3.1
+npm install @makecrypto/medusa-plugin-digital-downloads
 ```
 
-Alternatively, install the attested `v0.3.1` GitHub release artifact:
-
-```bash
-npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.1/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz
-```
-
-The URL becomes available only after the GitHub tag release succeeds. Pin an
-exact artifact/version in production rather than installing a moving branch.
+For reproducible deployments, commit your lockfile or pin an approved version.
+Verified tarballs, checksums, SBOMs, and provenance are available from
+[GitHub Releases](https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases).
+Never install a moving branch in production.
 
 Add the plugin to `medusa-config.ts`:
 

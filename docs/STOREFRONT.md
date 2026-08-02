@@ -10,18 +10,16 @@ App Router examples for the official Medusa Next.js starter are included under
 
 ## Install and import
 
-Install the exact plugin version in the storefront when you want its client or
-React exports:
+Install from npm in the storefront when you want its client or React exports:
 
 ```bash
-npm install @makecrypto/medusa-plugin-digital-downloads@0.3.1
+npm install @makecrypto/medusa-plugin-digital-downloads
 ```
 
-Or use the matching attested GitHub release artifact:
-
-```bash
-npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.1/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz
-```
+Keep the backend and storefront on the same resolved package version. For
+reproducible deployments, commit your lockfile or pin an approved version.
+Verified tarballs, checksums, SBOMs, and provenance are available from
+[GitHub Releases](https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases).
 
 Import from the dedicated storefront export:
 

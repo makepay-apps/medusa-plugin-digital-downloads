@@ -9,6 +9,23 @@ orders, customers, payment, tax, promotions, and fulfillment. The plugin links
 digital configuration to those records instead of creating a second commerce
 stack.
 
+## Screenshots
+
+### Digital Downloads overview
+
+![Medusa Admin Digital Downloads overview showing metrics, filters, and product configurations](docs/images/admin-digital-downloads-overview.jpg)
+
+### Native Medusa product integration
+
+![Digital delivery widget embedded in a Medusa product detail page](docs/images/admin-product-widget.jpg)
+
+### Product configuration and protected assets
+
+![Digital product configuration showing delivery policy and published protected assets](docs/images/admin-digital-product-configuration.jpg)
+
+See the [Medusa Admin guide](docs/ADMIN_GUIDE.md) for the complete merchant
+workflow and additional screenshots.
+
 ## Architecture
 
 The plugin domain is organized around:
@@ -43,23 +60,18 @@ upgrades.
 
 ## Install
 
-Install the exact released version in the Medusa backend:
+Install from npm in the Medusa backend:
 
 ```bash
-npm install @makecrypto/medusa-plugin-digital-downloads@0.3.1
+npm install @makecrypto/medusa-plugin-digital-downloads
 ```
 
-The matching attested GitHub release artifact can also be installed directly:
-
-```bash
-npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.1/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz
-```
-
-The release also publishes a `.sha256` checksum, a CycloneDX
-`.sbom.cdx.json`, and a GitHub build-provenance attestation for that tarball.
-Verify them before production installation; see [RELEASE.md](RELEASE.md).
-
-Verify the selected channel and package integrity during every deployment.
+For reproducible deployments, commit your lockfile or pin an approved version.
+Verified tarballs, `.sha256` checksums, CycloneDX SBOMs, and build-provenance
+attestations are available from
+[GitHub Releases](https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases).
+Verify the selected channel and package integrity during every deployment; see
+[RELEASE.md](RELEASE.md).
 
 Register it in `medusa-config.ts`. This minimal local-storage example uses a
 persistent directory outside any publicly served tree:
