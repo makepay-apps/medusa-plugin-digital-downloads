@@ -634,7 +634,7 @@ async function main() {
     )
     const metadata = await api("/store/digital-downloads", { store: true })
     const plugin = record(record(metadata.data).plugin)
-    assert(plugin.version === "0.3.0", "plugin metadata version must be 0.3.0")
+    assert(plugin.version === "0.3.1", "plugin metadata version must be 0.3.1")
     assert(
       record(plugin.attribution).text === "Brought to you by MakePay.io — crypto payment gateway.",
       "plugin attribution must match the MakePay text exactly",

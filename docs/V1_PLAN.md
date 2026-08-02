@@ -1,4 +1,4 @@
-# Version 1.0 delivery plan
+# Version 1 product scope and roadmap
 
 ## Product goal
 
@@ -233,7 +233,7 @@ Version 1.0 is complete only when all of the following are true:
 - Synchronize package, changelog, docs, git tag, and GitHub release versions.
 - Require green Node and PostgreSQL checks and a conflict-free release PR.
 - Inspect the packed tarball; install it into a clean fixture from the tarball.
-- Merge the verified PR to `main`, tag `v0.3.0`, create the GitHub release, and
+- Merge the verified PR to `main`, tag `v1.0.0`, create the GitHub release, and
   publish to npm when the repository's `NPM_TOKEN` permission is available.
 
 ## Acceptance scenarios

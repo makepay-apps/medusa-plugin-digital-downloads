@@ -281,8 +281,9 @@ following backend capabilities do not currently have dedicated Admin pages:
 - email-template editing or resend queues.
 
 Use documented Admin API routes or operational tooling for implemented backend
-capabilities. Items in [V1_PLAN.md](V1_PLAN.md) remain roadmap work until code,
-tests, and an Admin surface ship.
+capabilities. Items explicitly marked as backlog in
+[V1_PLAN.md](V1_PLAN.md) remain roadmap work until code, tests, and an Admin
+surface ship.
 
 ## Troubleshooting
 

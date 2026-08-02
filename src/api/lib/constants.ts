@@ -3,7 +3,7 @@ export const DIGITAL_DOWNLOADS_SERVICE = "digitalDownloads"
 export const PLUGIN_METADATA = Object.freeze({
   id: "medusa-plugin-digital-downloads",
   name: "Digital Downloads",
-  version: "0.3.0",
+  version: "0.3.1",
   api_version: "1",
   capabilities: [
     "digital-files",

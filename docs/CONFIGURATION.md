@@ -10,17 +10,17 @@ by the plugin or explicitly passed from `medusa-config.ts`.
 
 ## Install and register
 
-From the Medusa backend application, use npm after registry publication is
-verified:
+From the Medusa backend application, install the exact released version from
+npm:
 
 ```bash
-npm install @makecrypto/medusa-plugin-digital-downloads@0.3.0
+npm install @makecrypto/medusa-plugin-digital-downloads@0.3.1
 ```
 
-Alternatively, install the deterministic `v0.3.0` GitHub release artifact:
+Alternatively, install the attested `v0.3.1` GitHub release artifact:
 
 ```bash
-npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.0/makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz
+npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.1/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz
 ```
 
 The URL becomes available only after the GitHub tag release succeeds. Pin an

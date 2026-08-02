@@ -109,6 +109,7 @@ jobs:
             ${{ steps.package.outputs.file }}.sbom.cdx.json
       - name: Publish to npm when configured
         if: ${{ steps.npm-auth.outputs.configured == 'true' }}
-        run: npm publish --provenance --access public
+        run: npm publish "./${PACKAGE_FILE}" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_FILE: ${{ steps.package.outputs.file }}

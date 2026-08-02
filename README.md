@@ -9,15 +9,9 @@ orders, customers, payment, tax, promotions, and fulfillment. The plugin links
 digital configuration to those records instead of creating a second commerce
 stack.
 
-> **Version status:** this branch defines the `0.3.0` package contract. Verify the npm
-> release or signed GitHub release artifact, Git tag, release notes, and
-> checksum before production installation. [docs/V1_PLAN.md](docs/V1_PLAN.md)
-> records the v1 design and future roadmap; it is not an API-availability
-> promise.
+## Architecture
 
-## Version 1 architecture
-
-The v1 domain is organized around:
+The plugin domain is organized around:
 
 - Medusa product/variant-linked digital configuration;
 - immutable releases containing one or more protected or preview assets;
@@ -43,24 +37,22 @@ assets.
 - `@medusajs/ui` `>=4 <5`
 - React and React DOM `>=18.3.1 <20` for supplied storefront/Admin UI
 
-Version 1 is built and host-tested against Medusa 2.18 and runs source CI on
+The plugin is built and host-tested against Medusa 2.18 and runs source CI on
 Node.js 20 and 22. Test the exact Medusa/plugin combination before production
 upgrades.
 
 ## Install
 
-Install version `0.3.0` in the Medusa backend from either verified release
-channel. Use npm only when registry publication is available:
+Install the exact released version in the Medusa backend:
 
 ```bash
-npm install @makecrypto/medusa-plugin-digital-downloads@0.3.0
+npm install @makecrypto/medusa-plugin-digital-downloads@0.3.1
 ```
 
-The GitHub release contains the canonical deterministic package artifact and
-does not depend on npm credentials:
+The matching attested GitHub release artifact can also be installed directly:
 
 ```bash
-npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.0/makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz
+npm install https://github.com/makepay-apps/medusa-plugin-digital-downloads/releases/download/v0.3.1/makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz
 ```
 
 The release also publishes a `.sha256` checksum, a CycloneDX
@@ -271,7 +263,7 @@ Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 - [Migrations and rollback](docs/MIGRATIONS.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Testing strategy](docs/TESTING.md)
-- [Version 1 plan and explicit roadmap](docs/V1_PLAN.md)
+- [Product scope and roadmap](docs/V1_PLAN.md)
 - [Contributing](CONTRIBUTING.md)
 - [Release process](RELEASE.md)
 

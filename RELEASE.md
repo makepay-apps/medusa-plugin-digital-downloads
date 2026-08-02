@@ -111,11 +111,11 @@ Merge the reviewed release pull request to `main`, verify the required CI jobs
 on the merge commit, then create and push the exact version tag:
 
 ```bash
-git tag -a v0.3.0 -m "Release v0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.1 -m "Release v0.3.1"
+git push origin v0.3.1
 ```
 
-Replace `0.3.0` with the prepared package version. Do not reuse or move a
+Replace `0.3.1` with the prepared package version. Do not reuse or move a
 published tag.
 
 Before setup, installation, build, or publication, the tag workflow fetches
@@ -123,27 +123,27 @@ Before setup, installation, build, or publication, the tag workflow fetches
 It then checks that the tag matches `package.json`, runs `npm run check`, creates
 the tarball plus a SHA-256 checksum and CycloneDX SBOM, attests the tarball with
 GitHub build provenance, and publishes all three files in a GitHub release.
-Release Actions are pinned to reviewed commit SHAs. It runs
-`npm publish --provenance --access public` only when the repository has an
-`NPM_TOKEN` secret. The integration CI result for the same commit must already
-be green before tagging.
+Release Actions are pinned to reviewed commit SHAs. It publishes that same
+tarball to npm with provenance only when the repository has an `NPM_TOKEN`
+secret. The integration CI result for the same commit must already be green
+before tagging.
 
 ## 5. Post-release verification
 
 After the workflow completes, download these version-matched GitHub release
 assets:
 
-- `makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz`;
-- `makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz.sha256`;
-- `makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz.sbom.cdx.json`.
+- `makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz`;
+- `makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz.sha256`;
+- `makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz.sbom.cdx.json`.
 
 Then:
 
 1. Verify the tarball against its companion checksum with
-   `shasum -a 256 -c makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz.sha256`.
+   `shasum -a 256 -c makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz.sha256`.
 2. Verify GitHub build provenance with
-   `gh attestation verify makecrypto-medusa-plugin-digital-downloads-0.3.0.tgz --repo makepay-apps/medusa-plugin-digital-downloads`.
-3. Parse/review the CycloneDX SBOM and confirm it identifies version `0.3.0`.
+   `gh attestation verify makecrypto-medusa-plugin-digital-downloads-0.3.1.tgz --repo makepay-apps/medusa-plugin-digital-downloads`.
+3. Parse/review the CycloneDX SBOM and confirm it identifies version `0.3.1`.
 4. Compare the verified tarball's file list/content with the inspected
    candidate, install that tarball in a clean Medusa host, migrate, and run a
    boot/health smoke test.
