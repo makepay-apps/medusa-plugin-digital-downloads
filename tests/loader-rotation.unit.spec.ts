@@ -51,6 +51,11 @@ function persistedSettings(config: DigitalDownloadsModuleOptions) {
       resolved.encryptionKey as string,
       "encryption",
     ),
+    default_grant_ttl_seconds: resolved.defaultGrantTtlSeconds,
+    max_grant_ttl_seconds: resolved.maxGrantTtlSeconds,
+    guest_access_ttl_seconds: resolved.guestAccessTtlSeconds,
+    max_upload_size_bytes: resolved.maxUploadSizeBytes,
+    allow_guest_access: resolved.allowGuestAccess,
   }
 }
 
@@ -182,6 +187,59 @@ describe("digital-download loader rotation guards", () => {
         ENCRYPTION_B,
         "encryption",
       ),
+    })
+  })
+
+  it("narrows a migration-seeded 30-day guest TTL to a one-day module policy", async () => {
+    const original = options()
+    const { container, settingsService } = loaderHarness(
+      persistedSettings(original),
+    )
+
+    await expect(
+      digitalDownloadsLoader({
+        container,
+        options: options({ guestAccessTtlSeconds: 86_400 }),
+      } as any),
+    ).resolves.toBeUndefined()
+
+    expect(settingsService.update).toHaveBeenCalledTimes(1)
+    expect(settingsService.update).toHaveBeenCalledWith({
+      id: "ddset_global",
+      guest_access_ttl_seconds: 86_400,
+    })
+  })
+
+  it("reconciles persisted upload, grant, and guest policy above runtime ceilings", async () => {
+    const original = options({
+      defaultGrantTtlSeconds: 3_600,
+      maxGrantTtlSeconds: 86_400,
+      maxUploadSizeBytes: 512 * 1024 * 1024,
+      allowGuestAccess: true,
+    })
+    const { container, settingsService } = loaderHarness(
+      persistedSettings(original),
+    )
+
+    await expect(
+      digitalDownloadsLoader({
+        container,
+        options: options({
+          defaultGrantTtlSeconds: 60,
+          maxGrantTtlSeconds: 120,
+          maxUploadSizeBytes: 8 * 1024 * 1024,
+          allowGuestAccess: false,
+        }),
+      } as any),
+    ).resolves.toBeUndefined()
+
+    expect(settingsService.update).toHaveBeenCalledTimes(1)
+    expect(settingsService.update).toHaveBeenCalledWith({
+      id: "ddset_global",
+      default_grant_ttl_seconds: 60,
+      max_grant_ttl_seconds: 120,
+      max_upload_size_bytes: 8 * 1024 * 1024,
+      allow_guest_access: false,
     })
   })
 })

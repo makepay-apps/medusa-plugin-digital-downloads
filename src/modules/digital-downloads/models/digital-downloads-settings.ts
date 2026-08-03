@@ -20,6 +20,7 @@ const DigitalDownloadsSettings = model
     default_download_limit: model.number().nullable(),
     default_grant_ttl_seconds: model.number().default(900),
     max_grant_ttl_seconds: model.number().default(86400),
+    guest_access_ttl_seconds: model.number().default(2592000),
     max_upload_size_bytes: model.bigNumber().default(5368709120),
     allow_guest_access: model.boolean().default(true),
     require_order_email_match: model.boolean().default(true),
@@ -44,6 +45,8 @@ const DigitalDownloadsSettings = model
       `${default_grant_ttl_seconds} > 0` },
     { name: "CK_digital_downloads_settings_max_ttl", expression: ({ max_grant_ttl_seconds, default_grant_ttl_seconds }) =>
       `${max_grant_ttl_seconds} >= ${default_grant_ttl_seconds}` },
+    { name: "CK_digital_downloads_settings_guest_access_ttl", expression: ({ guest_access_ttl_seconds }) =>
+      `(${guest_access_ttl_seconds} >= 86400 AND ${guest_access_ttl_seconds} <= 31536000)` },
     { name: "CK_digital_downloads_settings_upload_size", expression: ({ max_upload_size_bytes }) =>
       `${max_upload_size_bytes} > 0` },
     { name: "CK_digital_downloads_settings_retention", expression: ({ event_retention_days }) =>

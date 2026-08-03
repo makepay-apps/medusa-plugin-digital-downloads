@@ -80,6 +80,8 @@ export interface MedusaSdkTransportOptions {
 export interface DigitalDownloadsClientOptions {
   transport: DigitalDownloadsTransport
   pathPrefix?: string
+  /** Headers required when consuming protected bytes, such as a Medusa publishable key. */
+  grantHeaders?: HeaderProvider
 }
 
 interface DigitalAccessGrantWireResponse {
@@ -489,13 +491,17 @@ export const createDigitalDownloadsClient = (
       requestOptions,
       { body, sensitive: true }
     )
+    const grantHeaders = await resolveHeaders(options.grantHeaders)
 
     return {
       grant: {
         ...grant,
         action: body.action,
         method: "GET",
-        headers: { authorization: `Bearer ${grant.token}` },
+        headers: {
+          ...grantHeaders,
+          authorization: `Bearer ${grant.token}`,
+        },
         supports_ranges: true,
       },
     }
@@ -650,9 +656,17 @@ export const createDigitalDownloadsClient = (
 
 /** Convenience constructor for storefronts that do not use @medusajs/js-sdk. */
 export const createDigitalDownloadsFetchClient = (
-  options: FetchTransportOptions & { pathPrefix?: string }
+  options: FetchTransportOptions & {
+    pathPrefix?: string
+    grantHeaders?: HeaderProvider
+  }
 ): DigitalDownloadsClient =>
   createDigitalDownloadsClient({
     transport: createFetchTransport(options),
     pathPrefix: options.pathPrefix,
+    grantHeaders:
+      options.grantHeaders ??
+      (options.publishableKey
+        ? { "x-publishable-api-key": options.publishableKey }
+        : undefined),
   })

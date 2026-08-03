@@ -15,7 +15,6 @@ import {
   MedusaError,
 } from "@medusajs/framework/utils"
 import {
-  DigitalEntitlementStatus,
   NotificationDeliveryState,
 } from "../../modules/digital-downloads/types"
 import { DIGITAL_DOWNLOAD_EVENTS } from "./events"
@@ -34,12 +33,6 @@ import {
   toFiniteAmount,
 } from "./utils"
 
-const TERMINAL_STATUSES = new Set([
-  DigitalEntitlementStatus.REVOKED,
-  DigitalEntitlementStatus.REFUNDED,
-  DigitalEntitlementStatus.EXPIRED,
-])
-
 async function resolveOrderIdFromPayment(
   container: any,
   paymentId: string
@@ -52,6 +45,24 @@ async function resolveOrderIdFromPayment(
   })
   return result.data?.[0]?.payment_collection?.order?.id
 }
+
+const resolveRevocationOrderStep = createStep(
+  "resolve-revocation-order",
+  async (input: RevokeOrderEntitlementsWorkflowInput, { container }) => {
+    const orderId = await resolveBoundOrderId(
+      container,
+      input.order_id ?? input.orderId,
+      input.payment_id ?? input.paymentId
+    )
+    if (!orderId) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "order_id or a payment linked to an order is required"
+      )
+    }
+    return new StepResponse({ ...input, order_id: orderId })
+  }
+)
 
 async function resolveBoundOrderId(
   container: any,
@@ -207,17 +218,11 @@ async function createNotificationOutbox(
 
 const revokeOrderEntitlementsStep = createStep(
   "revoke-order-entitlements",
-  async (input: RevokeOrderEntitlementsWorkflowInput, { container }) => {
-    const paymentId = input.payment_id ?? input.paymentId
-    let orderId = input.order_id ?? input.orderId
-    orderId = await resolveBoundOrderId(container, orderId, paymentId)
-    if (!orderId) {
-      throw new MedusaError(
-        MedusaError.Types.INVALID_DATA,
-        "order_id or a payment linked to an order is required"
-      )
-    }
-
+  async (
+    input: RevokeOrderEntitlementsWorkflowInput & { order_id: string },
+    { container }
+  ) => {
+    const orderId = input.order_id
     const service = resolveDigitalDownloadsService(container)
     const policy = input.policy ?? (input.trigger === "refund" ? "full_refund" : "all")
     const lineItemIds = new Set(input.line_item_ids ?? input.lineItemIds ?? [])
@@ -247,44 +252,24 @@ const revokeOrderEntitlementsStep = createStep(
       })
     }
 
-    const entitlements = await service.listDigitalEntitlements(
-      { order_id: orderId },
-      { take: 10_000 }
-    )
-    const selected = entitlements.filter(
-      (entitlement: UnknownRecord) =>
-        (!lineItemIds.size || lineItemIds.has(entitlement.order_line_item_id)) &&
-        !TERMINAL_STATUSES.has(entitlement.status)
-    )
-    const revoked: UnknownRecord[] = []
-    const notificationEvents: UnknownRecord[] = []
-
-    for (const entitlement of selected) {
-      let updated = await service.revokeEntitlement(entitlement.id, input.reason, {
+    const result = await service.revokeOrderEntitlements({
+      order_id: orderId,
+      line_item_ids: [...lineItemIds],
+      reason: input.reason,
+      trigger: input.trigger,
+      notify: true,
+      actor: {
         type: "workflow",
         id: input.trigger ?? "manual",
-      })
-      if (input.trigger === "refund") {
-        updated = await service.updateDigitalEntitlements({
-          id: updated.id,
-          status: DigitalEntitlementStatus.REFUNDED,
-        })
-      }
-      revoked.push(updated)
-      const delivery = await createNotificationOutbox(service, {
-        entitlement: updated,
-        type: "revoked",
-        data: { reason: input.reason },
-      })
-      if (delivery) {
-        notificationEvents.push({ delivery_id: delivery.id })
-      }
-    }
+      },
+    })
 
     return new StepResponse({
       order_id: orderId,
-      revoked,
-      notification_events: notificationEvents,
+      revoked: result.revoked,
+      notification_events: result.deliveries.map((delivery: UnknownRecord) => ({
+        delivery_id: delivery.id,
+      })),
       retained: false,
       policy,
     })
@@ -296,21 +281,19 @@ const revokeEntitlementStep = createStep(
   async (input: RevokeEntitlementWorkflowInput, { container }) => {
     const id = requireIdentifier(input, "entitlement_id", "entitlementId")
     const service = resolveDigitalDownloadsService(container)
-    const entitlement = await service.revokeEntitlement(
-      id,
-      input.reason,
-      input.actor ? { type: "admin", id: input.actor } : { type: "workflow" }
-    )
-    const delivery = input.notify === false
-      ? undefined
-      : await createNotificationOutbox(service, {
-          entitlement,
-          type: "revoked",
-          data: { reason: input.reason },
-        })
+    const result = await service.revokeEntitlementWithNotification({
+      entitlement_id: id,
+      reason: input.reason,
+      actor: input.actor
+        ? { type: "admin", id: input.actor }
+        : { type: "workflow" },
+      notify: input.notify,
+    })
     return new StepResponse({
-      entitlement,
-      notification_events: delivery ? [{ delivery_id: delivery.id }] : [],
+      entitlement: result.entitlement,
+      notification_events: result.delivery
+        ? [{ delivery_id: result.delivery.id }]
+        : [],
     })
   }
 )
@@ -320,6 +303,9 @@ const reissueEntitlementStep = createStep(
   async (input: ReissueEntitlementWorkflowInput, { container }) => {
     const id = requireIdentifier(input, "entitlement_id", "entitlementId")
     const service = resolveDigitalDownloadsService(container)
+    const expiresAt = input.expires_at !== undefined
+      ? input.expires_at
+      : input.expiresAt
     const reissued = await service.reissueEntitlement({
       entitlement_id: id,
       reason: input.reason ?? "manual reissue",
@@ -327,31 +313,15 @@ const reissueEntitlementStep = createStep(
         input.reset_downloads ?? input.resetDownloads ?? false,
       rotate_guest_token:
         input.rotate_guest_token ?? input.rotateGuestToken ?? true,
+      ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
+      // The notification worker creates a pending capability, redacts it from
+      // Medusa's persisted notification, and only then activates it. Minting
+      // here would leave an unreachable active capability beside that token.
+      create_guest_access: false,
       notify: input.notify ?? true,
     })
     const entitlement = reissued.entitlement
-    const guestAccessIdempotencyKey =
-      reissued.guest_access?.session?.idempotency_key
-    const delivery = input.notify === false
-      ? undefined
-      : await createNotificationOutbox(service, {
-          entitlement,
-          type: "reissued",
-          data: {
-            reason: input.reason ?? "manual reissue",
-            notification_idempotency_key:
-              guestAccessIdempotencyKey ??
-              entitlement.updated_at ??
-              "reissue",
-            ...(guestAccessIdempotencyKey
-              ? {
-                  guest_access: true,
-                  guest_access_idempotency_key:
-                    guestAccessIdempotencyKey,
-                }
-              : {}),
-          },
-        })
+    const delivery = reissued.delivery
     return new StepResponse({
       entitlement,
       delivery,
@@ -395,13 +365,14 @@ const enqueueNotificationStep = createStep(
 export const revokeOrderEntitlementsWorkflow = createWorkflow(
   { name: "digital-downloads-revoke-order", idempotent: true, store: true },
   (input: RevokeOrderEntitlementsWorkflowInput) => {
-    const resourceId = transform(
-      input,
-      (data) => data.order_id ?? data.orderId ?? data.payment_id ?? data.paymentId ?? "missing"
+    const resolved = resolveRevocationOrderStep(input)
+    const orderId = transform(
+      resolved,
+      (data) => data.order_id
     )
-    const lockKey = transform(resourceId, (id) => `digital-downloads:revoke:${id}`)
+    const lockKey = transform(orderId, (id) => `digital-downloads:order:${id}`)
     acquireLockStep({ key: lockKey, ttl: 120, timeout: 30, executeOnSubWorkflow: true })
-    const result = revokeOrderEntitlementsStep(input)
+    const result = revokeOrderEntitlementsStep(resolved)
     emitEventStep({
       eventName: DIGITAL_DOWNLOAD_EVENTS.ENTITLEMENT_REVOKED,
       data: result.revoked,
@@ -488,6 +459,41 @@ export async function markNotificationFailed(
     attempt_count: attempt,
     last_attempt_at: new Date(),
     next_retry_at: terminal ? null : computeBackoffDate(attempt),
+    lease_owner: null,
+    lease_expires_at: null,
+    error_code: "notification_failed",
+    error_message: error instanceof Error ? error.message.slice(0, 2000) : String(error),
+  })
+}
+
+export function sentNotificationRecoveryAttemptCount(
+  delivery: UnknownRecord
+): number {
+  const attempt = Math.max(1, Number(delivery.attempt_count ?? 0))
+  const maxAttempts = Math.max(1, Number(delivery.max_attempts ?? 8))
+  return Math.min(attempt, maxAttempts - 1)
+}
+
+/**
+ * Keeps post-send work retryable after the provider result and any bearer
+ * capability have been durably checkpointed and redacted. The claim service
+ * increments attempt_count and rejects rows already at max_attempts, so this
+ * reserves one attempt slot for activation/finalization recovery. Repeated
+ * recovery failures reuse that slot; the sent_redacted checkpoint ensures the
+ * subscriber never crosses the provider boundary again.
+ */
+export async function markSentNotificationRecoveryFailed(
+  service: any,
+  delivery: UnknownRecord,
+  error: unknown
+): Promise<void> {
+  const attempt = Math.max(1, Number(delivery.attempt_count ?? 0))
+  await service.updateNotificationDeliveries({
+    id: delivery.id,
+    state: NotificationDeliveryState.FAILED,
+    attempt_count: sentNotificationRecoveryAttemptCount(delivery),
+    last_attempt_at: new Date(),
+    next_retry_at: computeBackoffDate(attempt),
     lease_owner: null,
     lease_expires_at: null,
     error_code: "notification_failed",

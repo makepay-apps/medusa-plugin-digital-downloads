@@ -114,6 +114,8 @@ export interface ReissueEntitlementWorkflowInput {
   resetDownloads?: boolean
   rotate_guest_token?: boolean
   rotateGuestToken?: boolean
+  expires_at?: string | null
+  expiresAt?: string | null
   notify?: boolean
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@makecrypto/medusa-plugin-digital-downloads",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Native-feeling digital products, protected downloads, streaming, entitlements, and software licenses for Medusa v2.",
   "author": "MakePay",
   "license": "MIT",

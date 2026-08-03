@@ -23,15 +23,38 @@ stack.
 
 ![Digital product configuration showing delivery policy and published protected assets](docs/images/admin-digital-product-configuration.jpg)
 
+### Customer downloads and licenses
+
+![Customer account digital library with protected download, stream, and license actions](docs/images/storefront-customer-library.jpg)
+
+### Buyer-controlled license reveal
+
+![Customer digital library showing a deliberately revealed disposable license key](docs/images/storefront-license-revealed.jpg)
+
+### Digital delivery in native order history
+
+![Medusa customer order detail with order-scoped digital downloads and licenses](docs/images/storefront-order-history-digital-delivery.jpg)
+
+### Automated post-purchase email
+
+![Sanitized fixture preview of a post-purchase digital delivery email produced by a Medusa Notification Module provider](docs/images/customer-delivery-email.jpg)
+
+Email layout, branding, provider credentials, and transport remain owned by the
+host application's Medusa Notification Module. The plugin supplies durable
+delivery events, template data, retry state, and copy-ready provider/template
+[examples](examples/notification-provider/README.md).
+
 See the [Medusa Admin guide](docs/ADMIN_GUIDE.md) for the complete merchant
-workflow and additional screenshots.
+workflow and the [storefront guide](docs/STOREFRONT.md) for authenticated,
+per-order, guest, download, and license integration.
 
 ## Architecture
 
 The plugin domain is organized around:
 
 - Medusa product/variant-linked digital configuration;
-- immutable releases containing one or more protected or preview assets;
+- immutable releases containing protected/preview assets, or a zero-asset
+  license boundary backed by an enabled generated or pooled license policy;
 - local private storage and private S3/S3-compatible storage;
 - durable entitlements linked to Medusa orders, line items, and customers;
 - opaque, short-lived asset grants separate from ownership;
@@ -169,12 +192,22 @@ the merchant entry point. The intended flow is:
 
 1. Select a Medusa product and variants.
 2. Create digital configuration and a draft release.
-3. Upload protected assets and add explicitly public previews.
+3. Upload protected assets and add explicitly public previews. A license-only
+   release may have an empty asset set when it has an enabled generated or
+   pooled license policy.
 4. Configure delivery limits and an optional license policy.
 5. Publish a ready release.
 6. Complete checkout using normal Medusa storefront/payment behavior.
 7. Inspect issued entitlements on the order or in Digital Downloads Admin.
 8. Revoke, reissue, or investigate access through audited actions.
+
+Every digital product, including a license-only product, requires a current
+published release before fulfillment. Download, stream, and mixed releases
+must contain the ready deliverables required by their delivery type;
+license-only releases may publish with zero assets when an enabled generated
+or pooled license policy supplies the deliverable. Publishing with
+`notify_existing_customers: true` is intentionally unsupported until explicit
+entitlement update-policy semantics ship; use the default `false` value.
 
 The exact Admin surfaces available in the installed build are documented in
 [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md).
@@ -191,8 +224,19 @@ Each digital configuration chooses when fulfillment becomes eligible:
 The placed, completed, and captured subscribers converge on the same durable
 fulfillment operation. A five-minute reconciliation job retries pending,
 failed, or stale leased work. Order cancellation, payment refund, and
-chargeback/dispute subscribers apply the configured revocation policy. Delivery
-notifications use a durable outbox and a separate two-minute retry job.
+chargeback/dispute subscribers apply the configured revocation policy. When
+the host configures an email provider and the documented templates, delivery
+notifications use a durable outbox and a separate two-minute retry job. Email
+failure never rolls back ownership.
+
+Order issuance and order-wide revocation share one order lock. A selected
+refund/revocation commits every entitlement state change, capability/license
+invalidation, and its notification outbox rows in one transaction. Reissuing
+an expired entitlement renews its recorded purchase term by default (or uses
+an explicit replacement deadline) so the restored `active` state is usable.
+The hourly expiry job also scans a separately bounded terminal batch and
+atomically repairs missing expiry/revocation outboxes from legacy or interrupted
+lifecycle writes. It rechecks status and deadlines under the entitlement lock.
 
 The optional zero-cost Digital delivery Fulfillment Module provider can expose
 digital delivery in Medusa's native fulfillment UI. It does not issue
@@ -207,17 +251,14 @@ adapter, TypeScript response types, hooks, and accessible React primitives:
 
 ```ts
 import {
-  createDigitalDownloadsClient,
-  createFetchTransport,
+  createDigitalDownloadsFetchClient,
 } from "@makecrypto/medusa-plugin-digital-downloads/storefront"
 
-const digitalDownloads = createDigitalDownloadsClient({
-  transport: createFetchTransport({
-    baseUrl: process.env.NEXT_PUBLIC_MEDUSA_BACKEND_URL!,
-    publishableKey: process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY,
-    authToken: async () => getCustomerToken(),
-    credentials: "include",
-  }),
+const digitalDownloads = createDigitalDownloadsFetchClient({
+  baseUrl: process.env.NEXT_PUBLIC_MEDUSA_BACKEND_URL!,
+  publishableKey: process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY,
+  authToken: async () => getCustomerToken(),
+  credentials: "include",
 })
 ```
 
@@ -225,13 +266,19 @@ See [docs/STOREFRONT.md](docs/STOREFRONT.md) for customer/guest authentication,
 React examples, grant handling, and security guidance. See
 [docs/API.md](docs/API.md) for the backend contract.
 
+Use `DigitalLibrary` for the authenticated account-wide purchase library and
+`DigitalOrderDownloads` inside Medusa's native customer order-detail view. Both
+surface protected files and buyer-controlled license reveal without replacing
+the host's account, checkout, or order-history implementation.
+
 React customer resources require a changing, non-secret `identityKey` so
 cached state cannot cross a login/account boundary. Guest flows send
 `{ token, email? }`; order-email matching is enabled by default, so storefronts
 should prompt for the order email and send it as `email` on access/grants and
-`guest_email` on guest license reveal. The built-in browser opener is a
-convenience for safe content up to 64 MiB; use the streaming BFF pattern for
-larger or seekable assets.
+`guest_email` on guest license reveal. The guest purchase capability lifetime
+is configured separately from short-lived content grants and defaults to about
+30 days. The built-in browser opener is a convenience for safe content up to
+64 MiB; use the streaming BFF pattern for larger or seekable assets.
 
 ## MakePay interoperability
 

@@ -123,6 +123,22 @@
           "enumItems": [],
           "mappedType": "integer"
         },
+        "guest_access_ttl_seconds": {
+          "name": "guest_access_ttl_seconds",
+          "type": "integer",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "2592000",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
         "max_upload_size_bytes": {
           "name": "max_upload_size_bytes",
           "type": "numeric",
@@ -427,6 +443,11 @@
           "name": "CK_digital_downloads_settings_max_ttl",
           "expression": "max_grant_ttl_seconds >= default_grant_ttl_seconds",
           "definition": "check ((max_grant_ttl_seconds >= default_grant_ttl_seconds))"
+        },
+        {
+          "name": "CK_digital_downloads_settings_guest_access_ttl",
+          "expression": "(guest_access_ttl_seconds >= 86400 AND guest_access_ttl_seconds <= 31536000)",
+          "definition": "check (((guest_access_ttl_seconds >= 86400 AND guest_access_ttl_seconds <= 31536000)))"
         },
         {
           "name": "CK_digital_downloads_settings_upload_size",
@@ -1218,6 +1239,22 @@
           "enumItems": [],
           "mappedType": "text"
         },
+        "guest_access_epoch": {
+          "name": "guest_access_epoch",
+          "type": "integer",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "0",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
         "unit_index": {
           "name": "unit_index",
           "type": "integer",
@@ -1573,6 +1610,11 @@
           "name": "CK_digital_entitlement_unit_index",
           "expression": "unit_index >= 0",
           "definition": "check ((unit_index >= 0))"
+        },
+        {
+          "name": "CK_digital_entitlement_guest_access_epoch",
+          "expression": "guest_access_epoch >= 0",
+          "definition": "check ((guest_access_epoch >= 0))"
         },
         {
           "name": "CK_digital_entitlement_download_count",
@@ -6422,13 +6464,13 @@
           "expression": "CREATE INDEX IF NOT EXISTS \"IDX_notification_delivery_deleted_at\" ON \"notification_delivery\" (\"deleted_at\") WHERE deleted_at IS NULL"
         },
         {
-          "keyName": "UQ_notification_delivery_natural_key",
+          "keyName": "IDX_notification_delivery_natural_lookup",
           "columnNames": [],
           "composite": false,
           "constraint": false,
           "primary": false,
           "unique": false,
-          "expression": "CREATE UNIQUE INDEX IF NOT EXISTS \"UQ_notification_delivery_natural_key\" ON \"notification_delivery\" (\"entitlement_id\", \"template\", \"recipient_hash\") WHERE deleted_at IS NULL"
+          "expression": "CREATE INDEX IF NOT EXISTS \"IDX_notification_delivery_natural_lookup\" ON \"notification_delivery\" (\"entitlement_id\", \"template\", \"recipient_hash\") WHERE deleted_at IS NULL"
         },
         {
           "keyName": "IDX_notification_delivery_claim",

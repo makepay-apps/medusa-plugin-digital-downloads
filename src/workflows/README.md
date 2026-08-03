@@ -7,7 +7,8 @@ The exported Medusa workflows are grouped by responsibility:
 - fulfillment workflows issue quantity-aware customer or guest entitlements;
 - revocation workflows apply refund, chargeback, cancellation, and manual
   revocation policy;
-- maintenance workflows expire entitlements, retry bounded work, and clean
+- maintenance workflows expire entitlements, reconcile missing terminal
+  lifecycle outboxes, retry bounded work, and clean
   orphaned state.
 
 Steps use deterministic idempotency keys and compensation where an external

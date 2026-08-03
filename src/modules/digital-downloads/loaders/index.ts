@@ -28,6 +28,11 @@ interface InternalCountService {
   ): Promise<[Array<Record<string, unknown>>, number]>
 }
 
+function positiveSafeInteger(value: unknown): number | undefined {
+  const numeric = Number(value)
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : undefined
+}
+
 function secretFingerprint(
   value: string | undefined,
   purpose: "token" | "encryption",
@@ -75,6 +80,7 @@ export default async function digitalDownloadsLoader({
         default_download_limit: resolved.defaultDownloadLimit,
         default_grant_ttl_seconds: resolved.defaultGrantTtlSeconds,
         max_grant_ttl_seconds: resolved.maxGrantTtlSeconds,
+        guest_access_ttl_seconds: resolved.guestAccessTtlSeconds,
         max_upload_size_bytes: resolved.maxUploadSizeBytes,
         allow_guest_access: resolved.allowGuestAccess,
         storage_namespace_fingerprint: storageNamespaceFingerprint,
@@ -100,6 +106,50 @@ export default async function digitalDownloadsLoader({
 
   const current = settings[0]
   const changes: Record<string, unknown> = { id: current.id }
+  const persistedMaxGrantTtl = positiveSafeInteger(
+    current.max_grant_ttl_seconds,
+  )
+  const effectiveMaxGrantTtl = Math.min(
+    persistedMaxGrantTtl ?? resolved.maxGrantTtlSeconds,
+    resolved.maxGrantTtlSeconds,
+  )
+  if (persistedMaxGrantTtl !== effectiveMaxGrantTtl) {
+    changes.max_grant_ttl_seconds = effectiveMaxGrantTtl
+  }
+  const persistedDefaultGrantTtl = positiveSafeInteger(
+    current.default_grant_ttl_seconds,
+  )
+  const effectiveDefaultGrantTtl = Math.min(
+    persistedDefaultGrantTtl ?? resolved.defaultGrantTtlSeconds,
+    resolved.defaultGrantTtlSeconds,
+    effectiveMaxGrantTtl,
+  )
+  if (persistedDefaultGrantTtl !== effectiveDefaultGrantTtl) {
+    changes.default_grant_ttl_seconds = effectiveDefaultGrantTtl
+  }
+  const persistedMaxUploadSize = positiveSafeInteger(
+    current.max_upload_size_bytes,
+  )
+  const effectiveMaxUploadSize = Math.min(
+    persistedMaxUploadSize ?? resolved.maxUploadSizeBytes,
+    resolved.maxUploadSizeBytes,
+  )
+  if (persistedMaxUploadSize !== effectiveMaxUploadSize) {
+    changes.max_upload_size_bytes = effectiveMaxUploadSize
+  }
+  if (
+    resolved.allowGuestAccess === false &&
+    current.allow_guest_access !== false
+  ) {
+    changes.allow_guest_access = false
+  }
+  const persistedGuestAccessTtl = Number(current.guest_access_ttl_seconds)
+  if (
+    Number.isSafeInteger(persistedGuestAccessTtl) &&
+    persistedGuestAccessTtl > resolved.guestAccessTtlSeconds
+  ) {
+    changes.guest_access_ttl_seconds = resolved.guestAccessTtlSeconds
+  }
   if (current.storage_namespace_fingerprint !== storageNamespaceFingerprint) {
     const assetService = container.resolve("digitalAssetService") as InternalCountService
     const uploadService = container.resolve("digitalUploadService") as InternalCountService

@@ -119,6 +119,7 @@ describe("admin public-filter to persistence-filter adapters", () => {
           default_delivery_type: "download",
           default_grant_ttl_seconds: 900,
           max_grant_ttl_seconds: 86_400,
+          guest_access_ttl_seconds: 2_592_000,
           max_upload_size_bytes: 1024,
           allow_guest_access: true,
           require_order_email_match: true,
@@ -161,6 +162,7 @@ describe("admin public-filter to persistence-filter adapters", () => {
       expect(res.payload.settings.allowed_mime_types).toEqual([
         "application/pdf",
       ])
+      expect(res.payload.settings.guest_access_ttl_seconds).toBe(2_592_000)
       expect(res.payload.settings.readiness).toMatchObject({
         ready: true,
         token_secret_configured: true,

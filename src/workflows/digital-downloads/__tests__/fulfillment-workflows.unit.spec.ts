@@ -98,7 +98,7 @@ function quantityBudgetDependencies(quantities: number[]) {
     }),
     [DIGITAL_DOWNLOADS_MODULE]: asValue(service),
   })
-  return { container, order, remoteLink, service }
+  return { container, digitalProduct, order, remoteLink, service }
 }
 
 describe("fulfillmentStrategyReady", () => {
@@ -214,6 +214,37 @@ describe("issueOrderEntitlementsWorkflow", () => {
     expect(result.entitlements).toHaveLength(1_000)
     expect(deps.service.createFulfillmentOperations).toHaveBeenCalledTimes(1_000)
     expect(deps.service.issueOrderEntitlements).toHaveBeenCalledTimes(1_000)
+  })
+
+  it("fails a license-only item without a published current release", async () => {
+    const deps = quantityBudgetDependencies([1])
+    deps.digitalProduct.delivery_type = "license"
+    deps.digitalProduct.releases = []
+    Object.assign(deps.digitalProduct, {
+      license_policy: {
+        id: "dlpol_license_only",
+        strategy: "generated",
+        is_enabled: true,
+      },
+    })
+
+    const { result } = await issueOrderEntitlementsWorkflow(
+      deps.container,
+    ).run({
+      input: { order_id: deps.order.id, source: "order.placed" },
+      context: { transactionId: "test:license-only:missing-release" },
+    })
+
+    expect(result.entitlements).toEqual([])
+    expect(result.failures).toEqual([
+      expect.objectContaining({
+        message: "Digital product has no published, ready release",
+      }),
+    ])
+    expect(deps.service.issueOrderEntitlements).not.toHaveBeenCalled()
+    expect(deps.service.updateFulfillmentOperations).toHaveBeenCalledWith(
+      expect.objectContaining({ error_code: "release_not_ready" }),
+    )
   })
 
   it("defers invalid automatic configuration without leaking it and reconciles after correction", async () => {
@@ -349,6 +380,7 @@ describe("issueOrderEntitlementsWorkflow", () => {
   it("issues exactly one immutable entitlement per digital unit in a mixed order", async () => {
     const order = {
       id: "order_mixed",
+      display_id: 1042,
       email: "buyer@example.com",
       customer_id: "cus_1",
       customer: { id: "cus_1", has_account: true },
@@ -563,6 +595,7 @@ describe("issueOrderEntitlementsWorkflow", () => {
         entity: "order",
         fields: expect.arrayContaining([
           "items.raw_quantity",
+          "display_id",
           "customer.has_account",
           "payment_collections.captured_amount",
         ]),
@@ -581,6 +614,13 @@ describe("issueOrderEntitlementsWorkflow", () => {
       "order_mixed:item_digital:1",
     ])
     expect(issuedRows.map((row) => row.quantity)).toEqual([1, 1])
+    expect(issuedRows.every((row) => row.create_guest_access === false)).toBe(
+      true
+    )
+    expect(issuedRows[0].snapshot.order).toMatchObject({
+      id: "order_mixed",
+      display_id: 1042,
+    })
     expect(JSON.stringify(issuedRows[0].snapshot)).not.toContain("storage_key")
     expect(JSON.stringify(issuedRows[0].snapshot)).not.toContain(
       "private/album.zip"

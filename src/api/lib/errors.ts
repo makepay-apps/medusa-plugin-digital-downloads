@@ -116,13 +116,31 @@ function safeMessage(error: unknown, status: number): string {
     : "The request could not be completed."
 }
 
+function safeDetails(
+  error: unknown,
+  status: number,
+): Record<string, unknown> | undefined {
+  if (error instanceof DigitalDownloadsApiError) return error.details
+  if (status !== 416) return undefined
+
+  const totalSize = (error as { details?: { total_size?: unknown } })?.details
+    ?.total_size
+  if (
+    typeof totalSize !== "number" ||
+    !Number.isSafeInteger(totalSize) ||
+    totalSize < 0
+  ) {
+    return undefined
+  }
+  return { total_size: totalSize }
+}
+
 export function sendApiError(res: MedusaResponse, error: unknown): void {
   const status = safeStatus(error)
   const code = safeCode(error, status)
   const message = safeMessage(error, status)
   const requestId = (res.req as { requestId?: string } | undefined)?.requestId
-  const details =
-    error instanceof DigitalDownloadsApiError ? error.details : undefined
+  const details = safeDetails(error, status)
 
   if (
     status === 416 &&

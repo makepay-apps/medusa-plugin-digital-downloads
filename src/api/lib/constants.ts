@@ -3,7 +3,7 @@ export const DIGITAL_DOWNLOADS_SERVICE = "digitalDownloads"
 export const PLUGIN_METADATA = Object.freeze({
   id: "medusa-plugin-digital-downloads",
   name: "Digital Downloads",
-  version: "0.3.2",
+  version: "0.4.0",
   api_version: "1",
   capabilities: [
     "digital-files",
@@ -36,7 +36,7 @@ export const PRIVATE_NO_STORE_HEADERS = Object.freeze({
 })
 
 export const CONTENT_SECURITY_HEADERS = Object.freeze({
-  "Cache-Control": "private, no-store, max-age=0",
+  "Cache-Control": "private, no-store, max-age=0, no-transform",
   "Content-Security-Policy": "default-src 'none'; sandbox",
   "Cross-Origin-Resource-Policy": "same-site",
   "Referrer-Policy": "no-referrer",

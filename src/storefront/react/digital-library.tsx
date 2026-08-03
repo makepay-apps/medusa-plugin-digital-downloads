@@ -237,6 +237,12 @@ export interface DigitalEntitlementCardProps {
   access?: DigitalStorefrontAccess
   client?: DigitalDownloadsClient
   className?: string
+  /**
+   * Buyer-facing order reference supplied by a host order-detail page. When it
+   * is omitted, the entitlement's snapshotted display ID or internal order ID
+   * is shown.
+   */
+  orderReference?: ReactNode
   onGrant?: (
     grant: DigitalAccessGrant,
     entitlement: DigitalEntitlement,
@@ -254,6 +260,7 @@ export const DigitalEntitlementCard = ({
   access,
   client,
   className,
+  orderReference,
   onGrant,
   onLicenseRevealed,
 }: DigitalEntitlementCardProps) => {
@@ -351,7 +358,9 @@ export const DigitalEntitlementCard = ({
       <dl>
         <div>
           <dt>Order</dt>
-          <dd>{entitlement.order_display_id ?? entitlement.order_id}</dd>
+          <dd>
+            {orderReference ?? entitlement.order_display_id ?? entitlement.order_id}
+          </dd>
         </div>
         <div>
           <dt>Purchased</dt>
@@ -488,6 +497,8 @@ export interface DigitalLibraryProps {
   empty?: ReactNode
   loading?: ReactNode
   showAttribution?: boolean
+  /** Override the order reference when this library is scoped to one order. */
+  orderReference?: ReactNode
   renderEntitlement?: (
     entitlement: DigitalEntitlement,
     index: number
@@ -508,6 +519,7 @@ export const DigitalLibrary = ({
   empty = "Your digital purchases will appear here.",
   loading = "Loading your digital library…",
   showAttribution = true,
+  orderReference,
   renderEntitlement,
   onGrant,
   onLicenseRevealed,
@@ -554,6 +566,7 @@ export const DigitalLibrary = ({
                   entitlement={entitlement}
                   onGrant={onGrant}
                   onLicenseRevealed={onLicenseRevealed}
+                  orderReference={orderReference}
                 />
               )}
             </li>

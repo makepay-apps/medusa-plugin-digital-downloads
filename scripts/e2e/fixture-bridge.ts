@@ -1,5 +1,13 @@
-import { chmod, mkdir, realpath, rename, writeFile } from "node:fs/promises"
+import {
+  chmod,
+  lstat,
+  mkdir,
+  realpath,
+  rename,
+  writeFile,
+} from "node:fs/promises"
 import { readFileSync, realpathSync } from "node:fs"
+import { createRequire } from "node:module"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -14,6 +22,7 @@ if (!fixtureRootInput || !path.isAbsolute(fixtureRootInput)) {
 }
 const FIXTURE_ROOT = realpathSync(path.resolve(fixtureRootInput))
 const RUNTIME_ROOT = path.join(FIXTURE_ROOT, "runtime")
+const PLUGIN_NAME = "@makecrypto/medusa-plugin-digital-downloads"
 
 if (
   new Set([
@@ -44,6 +53,122 @@ function safeIdentifier(value: string, name: string): string {
     throw new Error(`Invalid ${name}`)
   }
   return value
+}
+
+function strictDescendant(root: string, target: string): boolean {
+  const relative = path.relative(root, target)
+  return Boolean(relative) &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+}
+
+function safeNotificationProjection(delivery: Record<string, any>) {
+  return {
+    id: delivery.id,
+    entitlement_id: delivery.entitlement_id,
+    state: delivery.state,
+    attempt_count: Number(delivery.attempt_count ?? 0),
+    template: delivery.template,
+    sent_at: delivery.sent_at ?? null,
+    provider_message_id: delivery.provider_message_id ?? null,
+    error_code: delivery.error_code ?? null,
+    next_retry_at: delivery.next_retry_at ?? null,
+  }
+}
+
+async function bridgeOutputPath(): Promise<string> {
+  await mkdir(RUNTIME_ROOT, { recursive: true, mode: 0o700 })
+  await chmod(RUNTIME_ROOT, 0o700)
+  const canonicalRuntime = await realpath(RUNTIME_ROOT)
+  const requestedOutput = path.resolve(required("E2E_BRIDGE_OUTPUT"))
+  if (!strictDescendant(canonicalRuntime, requestedOutput)) {
+    throw new Error(
+      "Bridge output must be a file below the private fixture runtime directory"
+    )
+  }
+  if (await lstat(requestedOutput).catch(() => undefined)) {
+    throw new Error("Bridge output already exists")
+  }
+  return requestedOutput
+}
+
+async function writeBridgeOutput(payload: Record<string, unknown>): Promise<void> {
+  const requestedOutput = await bridgeOutputPath()
+  const temporary = `${requestedOutput}.${process.pid}.tmp`
+  await writeFile(temporary, `${JSON.stringify(payload)}\n`, {
+    mode: 0o600,
+    flag: "wx",
+  })
+  await rename(temporary, requestedOutput)
+  const stored = await lstat(requestedOutput)
+  if (stored.isSymbolicLink() || !stored.isFile() || (stored.mode & 0o077) !== 0) {
+    throw new Error("Bridge output permissions are unsafe")
+  }
+}
+
+async function deliveryForEntitlement(
+  service: any,
+  entitlementId: string
+): Promise<Record<string, any>> {
+  const deliveries = await service.listNotificationDeliveries(
+    {
+      entitlement_id: entitlementId,
+      template: "digital-downloads-delivery",
+    },
+    { take: 10 }
+  )
+  if (deliveries.length !== 1) {
+    throw new Error("Expected exactly one delivery notification for entitlement")
+  }
+  return deliveries[0]
+}
+
+async function retryNotification(
+  container: any,
+  service: any,
+  entitlementId: string
+): Promise<Record<string, any>> {
+  const delivery = await deliveryForEntitlement(service, entitlementId)
+  if (delivery.state !== "failed") {
+    throw new Error("Only a failed fixture notification may be retried")
+  }
+  await service.updateNotificationDeliveries({
+    id: delivery.id,
+    next_retry_at: new Date(0),
+    lease_owner: null,
+    lease_expires_at: null,
+  })
+
+  const requireFromBackend = createRequire(
+    path.join(process.cwd(), "package.json")
+  )
+  const packageJsonPath = await realpath(
+    requireFromBackend.resolve(`${PLUGIN_NAME}/package.json`)
+  )
+  const packageRoot = path.dirname(packageJsonPath)
+  const subscriberPath = await realpath(
+    path.join(
+      packageRoot,
+      ".medusa/server/src/subscribers/digital-notification-requested.js"
+    )
+  )
+  if (!strictDescendant(packageRoot, subscriberPath)) {
+    throw new Error("Installed notification subscriber escaped its package root")
+  }
+  const subscriber = requireFromBackend(subscriberPath)
+  const handler = subscriber.default ?? subscriber.deliverDigitalNotification
+  if (typeof handler !== "function") {
+    throw new Error("Installed notification subscriber is unavailable")
+  }
+  await handler({
+    event: {
+      name: "digital_downloads.notification.requested",
+      data: { delivery_id: delivery.id },
+    },
+    container,
+  })
+  return deliveryForEntitlement(service, entitlementId)
 }
 
 async function ensureFixtureAdmin(container: any): Promise<void> {
@@ -105,40 +230,33 @@ export default async function fixtureBridge({ container }: { container: any }) {
     await ensureFixtureAdmin(container)
     return
   }
-  if (action !== "guest-token") {
-    throw new Error("Unsupported fixture bridge action")
-  }
-
-  await mkdir(RUNTIME_ROOT, { recursive: true, mode: 0o700 })
-  await chmod(RUNTIME_ROOT, 0o700)
-  const canonicalRuntime = await realpath(RUNTIME_ROOT)
-  const requestedOutput = path.resolve(required("E2E_BRIDGE_OUTPUT"))
-  const relativeOutput = path.relative(canonicalRuntime, requestedOutput)
-  if (
-    !relativeOutput ||
-    relativeOutput === ".." ||
-    relativeOutput.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(relativeOutput)
-  ) {
-    throw new Error("Bridge output must be a file below the private fixture runtime directory")
-  }
 
   const entitlementId = safeIdentifier(
     required("E2E_ENTITLEMENT_ID"),
     "entitlement ID",
   )
   const service = container.resolve("digitalDownloads") as any
+
+  if (action === "notification-state") {
+    const delivery = await deliveryForEntitlement(service, entitlementId)
+    await writeBridgeOutput({ delivery: safeNotificationProjection(delivery) })
+    return
+  }
+
+  if (action === "retry-notification") {
+    const delivery = await retryNotification(container, service, entitlementId)
+    await writeBridgeOutput({ delivery: safeNotificationProjection(delivery) })
+    return
+  }
+
+  if (action !== "guest-token") {
+    throw new Error("Unsupported fixture bridge action")
+  }
+
   const result = await service.createGuestAccessSession({
     entitlement_id: entitlementId,
     idempotency_key: `${entitlementId}:guest:v1`,
     metadata: { purpose: "packed_fixture_e2e" },
   })
-
-  const temporary = `${requestedOutput}.${process.pid}.tmp`
-  await writeFile(
-    temporary,
-    `${JSON.stringify({ token: result.token, session_id: result.session.id })}\n`,
-    { mode: 0o600, flag: "wx" },
-  )
-  await rename(temporary, requestedOutput)
+  await writeBridgeOutput({ token: result.token, session_id: result.session.id })
 }

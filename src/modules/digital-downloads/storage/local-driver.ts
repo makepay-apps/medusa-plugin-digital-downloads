@@ -45,6 +45,9 @@ function validKey(key: string): string {
   if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
     throw new Error("Storage key contains an unsafe path segment")
   }
+  if (segments.some((segment) => Buffer.byteLength(segment, "utf8") > 255)) {
+    throw new Error("Storage key contains an oversized path segment")
+  }
   return segments.join("/")
 }
 
@@ -482,7 +485,10 @@ export class ProtectedLocalStorageDriver implements StorageDriver {
   }
 
   private temporaryPath(destination: string): string {
-    return `${destination}.upload-${process.pid}-${randomUUID()}`
+    return path.join(
+      path.dirname(destination),
+      `.upload-${process.pid}-${randomUUID()}`,
+    )
   }
 
   private async createTemporaryFile(temporary: string): Promise<FileHandle> {

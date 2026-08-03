@@ -38,8 +38,9 @@ Version 1.0 is complete only when all of the following are true:
    quantity greater than one, retries, duplicate events, cancellation, refund,
    deleted catalog records, and expired access are covered by tests.
 9. Admin routes/widgets, a typed storefront client, accessible React UI
-   primitives, a Next.js starter example, and an OpenAPI 3.1 document ship in
-   the package.
+   primitives, account-library and native order-history Next.js examples,
+   notification-provider/template examples, and an OpenAPI 3.1 document ship
+   in the package.
 10. Lint, strict type checking, unit tests, PostgreSQL module/API integration
     tests, plugin build, package-content validation, clean-install validation,
     and real-browser scenarios pass in repeated runs.
@@ -57,8 +58,10 @@ Version 1.0 is complete only when all of the following are true:
   and software license.
 - Delivery modes: download, protected stream, license only, or content plus a
   license (`mixed`).
-- Draft, published, superseded, and retired releases; immutable fulfillment
-  snapshots so later catalog edits cannot redirect an old purchase.
+- Draft, published, superseded, and retired releases; every delivery mode uses a
+  published immutable fulfillment snapshot so later catalog edits cannot
+  redirect an old purchase. License-only releases may have zero assets when an
+  enabled generated or pooled license policy supplies the deliverable.
 - Protected local filesystem storage and private S3/S3-compatible storage,
   including AWS S3, MinIO, Cloudflare R2, DigitalOcean Spaces, and Supabase's S3
   endpoint when configured with compatible credentials.
@@ -69,8 +72,9 @@ Version 1.0 is complete only when all of the following are true:
   purchases. An order event may be delivered more than once without producing
   duplicate ownership or license keys.
 - Entitlement lifecycle: pending, active, suspended, expired, refunded, revoked.
-- Per-product or store-default download count, grant lifetime, entitlement
-  lifetime, streaming policy, first-IP lock, and refund/cancellation behavior.
+- Per-product or store-default download count, content-grant lifetime, distinct
+  guest purchase-capability lifetime, entitlement lifetime, streaming policy,
+  first-IP lock, and refund/cancellation behavior.
 - Opaque, short-lived, asset-bound download grants. Stored data contains only a
   hash of a live bearer token.
 - Generated license patterns and imported license pools, encrypted recoverable
@@ -98,15 +102,19 @@ Version 1.0 is complete only when all of the following are true:
 - Accessible Digital Library, Product Preview, Download Action, License Reveal,
   and License Activation React primitives with loading, empty, error, revoked,
   expired, and limit-reached states.
-- Next.js Medusa starter integration showing product previews and an account
-  library without replacing core checkout code.
+- Next.js Medusa starter integration showing product previews, an account
+  library, and order-scoped delivery in native customer order history without
+  replacing core checkout code.
 - Optional Notification Module delivery driven by plugin events and merchant
-  template identifiers. Email failure never rolls back ownership and is visible
-  for retry.
+  template identifiers, with a copy-ready provider/template example. The host
+  owns rendering, branding, credentials, and transport; email failure never
+  rolls back ownership and is visible for retry.
 - Admin filters, search, stable pagination, status totals, bulk revoke/reactivate,
   resend/reissue, license-pool capacity, and storage-health indicators.
-- Scheduled cleanup of expired one-time grants, stale upload reservations,
-  bounded audit data, and orphaned unreferenced files after a safety delay.
+- Scheduled entitlement expiry and orphaned Medusa product-link reconciliation.
+  Expired upload/grant rows, audit retention, and unreferenced object deletion
+  require an operator-approved, database-aware retention job; version 0.4 does
+  not delete physical objects automatically.
 - OpenAPI 3.1 contracts and copy-ready environment/configuration examples.
 
 ### P2 — included where safe and testable

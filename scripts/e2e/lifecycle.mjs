@@ -2,7 +2,17 @@
 
 import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises"
 import { readFileSync, realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -27,7 +37,15 @@ const ADMIN_EMAIL = required("E2E_ADMIN_EMAIL")
 const ADMIN_PASSWORD = required("E2E_ADMIN_PASSWORD")
 const BRIDGE_SCRIPT = path.resolve(required("E2E_BRIDGE_SCRIPT"))
 const RESULT_PATH = path.resolve(required("E2E_RESULT_PATH"))
+const NOTIFICATION_CAPTURE_ROOT = path.resolve(
+  required("E2E_NOTIFICATION_CAPTURE_ROOT"),
+)
+const SHOWCASE_CREDENTIAL_PATH = path.join(
+  path.dirname(RESULT_PATH),
+  "showcase-credentials.json",
+)
 const USER_AGENT = "makepay-digital-downloads-packed-e2e/1.0"
+const CAPABILITY = /(?:dda|ddg|ddu)_[A-Za-z0-9._~-]+|license_key|guest_access_token/i
 
 if (
   process.env.DIGITAL_DOWNLOADS_E2E !== "1" ||
@@ -67,9 +85,17 @@ if (
 ) {
   throw new Error("E2E_RESULT_PATH must be below the private fixture runtime directory")
 }
+if (
+  !strictDescendant(RUNTIME_ROOT, NOTIFICATION_CAPTURE_ROOT) ||
+  path.dirname(NOTIFICATION_CAPTURE_ROOT) !== path.dirname(RESULT_PATH)
+) {
+  throw new Error(
+    "E2E_NOTIFICATION_CAPTURE_ROOT must be below the current private run directory",
+  )
+}
 
 const evidence = {
-  schema_version: 1,
+  schema_version: 2,
   run_id: RUN_ID,
   storage_provider: STORAGE_PROVIDER,
   started_at: new Date().toISOString(),
@@ -82,6 +108,7 @@ const evidence = {
 let adminToken
 let customerAToken
 let customerBToken
+const dynamicSecrets = new Set()
 
 function required(name) {
   const value = process.env[name]?.trim()
@@ -93,6 +120,14 @@ function safeSlug(value) {
   const result = value.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "")
   if (!result || result.length > 80) throw new Error("E2E_RUN_ID is invalid")
   return result
+}
+
+function strictDescendant(root, target) {
+  const relative = path.relative(root, target)
+  return Boolean(relative) &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
 }
 
 function assert(condition, message) {
@@ -131,6 +166,7 @@ function redactedText(value) {
     process.env.DIGITAL_DOWNLOADS_LOCAL_SIGNING_SECRET,
     process.env.DIGITAL_DOWNLOADS_S3_ACCESS_KEY_ID,
     process.env.DIGITAL_DOWNLOADS_S3_SECRET_ACCESS_KEY,
+    ...dynamicSecrets,
   ]) {
     if (secret) output = output.split(secret).join("[redacted]")
   }
@@ -257,6 +293,7 @@ async function authenticateAdmin() {
 async function registerCustomer(label) {
   const email = `${RUN_ID}-${label}@digital-downloads.local`
   const password = `E2E-${RUN_ID}-${label}-Password!42`
+  dynamicSecrets.add(password)
   const registration = await api("/auth/customer/emailpass/register", {
     method: "POST",
     json: { email, password },
@@ -278,7 +315,7 @@ async function registerCustomer(label) {
   })
   const token = record(login.data).token
   assert(typeof token === "string" && token.length > 32, "customer login must return a token")
-  return { email, token }
+  return { email, password, token }
 }
 
 async function createCommerceProduct(context) {
@@ -287,20 +324,20 @@ async function createCommerceProduct(context) {
     method: "POST",
     admin: true,
     json: {
-      title: `Digital Downloads E2E ${RUN_ID}`,
+      title: "MakePay Creator Bundle",
       handle,
-      description: "Disposable packed-plugin E2E product",
+      description: "An ebook, studio audio track, and single-seat creator license",
       status: "published",
       shipping_profile_id: context.shippingProfileId,
       sales_channels: [{ id: context.salesChannelId }],
-      options: [{ title: "Format", values: ["Digital"] }],
+      options: [{ title: "Format", values: ["Complete edition"] }],
       variants: [
         {
-          title: "Digital",
+          title: "Complete edition",
           sku: `DDE2E-${RUN_ID}`.toUpperCase().slice(0, 64),
           manage_inventory: false,
           allow_backorder: true,
-          options: { Format: "Digital" },
+          options: { Format: "Complete edition" },
           prices: [{ currency_code: context.currencyCode, amount: 1299 }],
         },
       ],
@@ -590,28 +627,229 @@ async function content(grant, assetId, range, expected = 200) {
   })
 }
 
-async function guestToken(entitlementId) {
-  await mkdir(path.dirname(RESULT_PATH), { recursive: true, mode: 0o700 })
-  const output = path.join(path.dirname(RESULT_PATH), `guest-${entitlementId}.json`)
-  await unlink(output).catch(() => undefined)
+async function bridgeAction(action, entitlementId) {
+  assert(
+    ["notification-state", "retry-notification"].includes(action),
+    "fixture bridge action must be allow-listed",
+  )
+  const suffix = createHash("sha256")
+    .update(`${action}\0${entitlementId}`)
+    .digest("hex")
+    .slice(0, 24)
+  const output = path.join(
+    path.dirname(RESULT_PATH),
+    `bridge-${action}-${suffix}.json`,
+  )
+  await unlink(output).catch((error) => {
+    if (error?.code !== "ENOENT") throw error
+  })
   const bridge = spawnSync("pnpm", ["medusa", "exec", BRIDGE_SCRIPT], {
     cwd: BACKEND_ROOT,
     env: {
       ...process.env,
-      E2E_BRIDGE_ACTION: "guest-token",
+      E2E_BRIDGE_ACTION: action,
       E2E_ENTITLEMENT_ID: entitlementId,
       E2E_BRIDGE_OUTPUT: output,
     },
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
+    timeout: 120_000,
+    killSignal: "SIGTERM",
   })
-  if (bridge.status !== 0) {
-    throw new Error(`Fixture bridge failed: ${redactedText(`${bridge.stdout}\n${bridge.stderr}`)}`)
+  if (bridge.error || bridge.status !== 0) {
+    throw new Error(
+      `Fixture bridge ${action} failed: ${redactedText(
+        `${bridge.error?.message ?? ""}\n${bridge.stdout}\n${bridge.stderr}`,
+      )}`,
+    )
   }
-  const payload = JSON.parse(await readFile(output, "utf8"))
-  await unlink(output)
-  assert(typeof payload.token === "string" && payload.token.length >= 32, "fixture bridge must return a guest capability")
-  return payload.token
+  try {
+    const stored = await lstat(output)
+    assert(
+      stored.isFile() && !stored.isSymbolicLink() && (stored.mode & 0o077) === 0,
+      "fixture bridge output must be a private regular file",
+    )
+    return JSON.parse(await readFile(output, "utf8"))
+  } finally {
+    await unlink(output).catch(() => undefined)
+  }
+}
+
+async function notificationState(entitlementId) {
+  const payload = await bridgeAction("notification-state", entitlementId)
+  return record(payload.delivery)
+}
+
+async function retryNotification(entitlementId) {
+  const payload = await bridgeAction("retry-notification", entitlementId)
+  return record(payload.delivery)
+}
+
+async function privateJsonRecords(directory) {
+  const root = await realpath(NOTIFICATION_CAPTURE_ROOT)
+  const canonicalDirectory = await realpath(directory)
+  assert(
+    strictDescendant(root, canonicalDirectory),
+    "notification evidence directory must remain below its private root",
+  )
+  const records = []
+  for (const name of (await readdir(canonicalDirectory)).slice(-500)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,239}\.json$/.test(name)) continue
+    const candidate = path.join(canonicalDirectory, name)
+    const source = await lstat(candidate)
+    assert(
+      !source.isSymbolicLink() && source.isFile(),
+      "notification evidence entries must be regular files",
+    )
+    const canonical = await realpath(candidate)
+    assert(
+      strictDescendant(canonicalDirectory, canonical),
+      "notification evidence entry escaped its private directory",
+    )
+    const info = await lstat(canonical)
+    assert(
+      !info.isSymbolicLink() &&
+        info.isFile() &&
+        info.size <= 256 * 1024 &&
+        (info.mode & 0o077) === 0,
+      "notification evidence entry must be bounded and owner-only",
+    )
+    try {
+      records.push({
+        path: canonical,
+        value: record(JSON.parse(await readFile(canonical, "utf8"))),
+      })
+    } catch {
+      // Generated captures are published by rename; ignore unrelated bounded
+      // JSON rather than treating it as lifecycle evidence.
+    }
+  }
+  return records
+}
+
+async function waitForNotificationCapture(input) {
+  return poll(
+    `captured ${input.template ?? "delivery"} email for ${input.entitlementId}`,
+    async () => {
+      const captures = await privateJsonRecords(
+        path.join(NOTIFICATION_CAPTURE_ROOT, "captures"),
+      )
+      return captures.find(({ value }) =>
+        value.entitlement_id === input.entitlementId &&
+        value.order_id === input.orderId &&
+        value.to === input.email.toLowerCase() &&
+        value.template === (input.template ?? "digital-downloads-delivery")
+      )
+    },
+    Boolean,
+    45_000,
+  )
+}
+
+async function waitForRetryMarker(entitlementId) {
+  return poll(
+    `fail-once provider marker for ${entitlementId}`,
+    async () => {
+      const attempts = await privateJsonRecords(
+        path.join(NOTIFICATION_CAPTURE_ROOT, "attempts"),
+      )
+      return attempts.find(
+        ({ value }) => value.entitlement_id === entitlementId,
+      )
+    },
+    Boolean,
+    45_000,
+  )
+}
+
+function assertRegisteredCapture(capture, expectedOrderLabel) {
+  const preview = record(capture.value.preview)
+  assert(capture.value.channel === "email", "registered delivery must use email")
+  assert(
+    capture.value.template === "digital-downloads-delivery",
+    "registered delivery must use the delivery template",
+  )
+  assert(
+    !capture.value.secret,
+    "registered delivery capture must not contain a guest capability",
+  )
+  assert(
+    !CAPABILITY.test(JSON.stringify(capture.value)),
+    "registered delivery capture must not contain capabilities or license keys",
+  )
+  assert(
+    typeof preview.html === "string" &&
+      /^<!doctype html><html><body>[\s\S]*<\/body><\/html>$/.test(preview.html) &&
+      preview.html.includes(String(preview.subject)) &&
+      preview.html.includes(String(preview.order_label)),
+    "registered delivery capture must contain its provider-rendered email HTML",
+  )
+  assert(
+    preview.order_label === expectedOrderLabel,
+    "registered delivery capture must use the native buyer-facing order reference",
+  )
+  assert(
+    !/<(?!\/?(?:html|body|h1|p|strong)>|!doctype html>)[^>]+>/i.test(
+      preview.html,
+    ),
+    "provider-rendered email HTML must remain inert",
+  )
+}
+
+async function consumeGuestCapture(capture) {
+  const token = record(capture.value.secret).guest_access_token
+  assert(
+    typeof token === "string" && /^dda_[A-Za-z0-9._~-]{24,}$/.test(token),
+    "guest delivery provider must receive a bounded bearer capability",
+  )
+  assert(
+    JSON.stringify(capture.value.payload).split(token).length === 1,
+    "redacted email payload must not duplicate its private guest capability",
+  )
+  await unlink(capture.path)
+  assert(
+    !(await lstat(capture.path).catch(() => undefined)),
+    "guest capability capture must be deleted immediately after consumption",
+  )
+  return token
+}
+
+async function waitForNotificationState(entitlementId, predicate, description) {
+  return poll(
+    description,
+    () => notificationState(entitlementId),
+    predicate,
+    45_000,
+  )
+}
+
+async function writeShowcaseCredentials(input) {
+  dynamicSecrets.add(input.password)
+  const temporary = `${SHOWCASE_CREDENTIAL_PATH}.${process.pid}.tmp`
+  await writeFile(
+    temporary,
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        purpose: "private packed-E2E browser showcase credentials",
+        customer_email: input.email,
+        customer_password: input.password,
+        order_display_id: input.orderDisplayId,
+        order_id: input.orderId,
+        variant_id: input.variantId,
+        storefront_path: input.storefrontPath,
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600, flag: "wx" },
+  )
+  await rename(temporary, SHOWCASE_CREDENTIAL_PATH)
+  const stored = await lstat(SHOWCASE_CREDENTIAL_PATH)
+  assert(
+    stored.isFile() && !stored.isSymbolicLink() && (stored.mode & 0o077) === 0,
+    "showcase credentials must be stored as a private regular file",
+  )
 }
 
 async function writeEvidence() {
@@ -634,7 +872,7 @@ async function main() {
     )
     const metadata = await api("/store/digital-downloads", { store: true })
     const plugin = record(record(metadata.data).plugin)
-    assert(plugin.version === "0.3.2", "plugin metadata version must be 0.3.2")
+    assert(plugin.version === "0.4.0", "plugin metadata version must be 0.4.0")
     assert(
       record(plugin.attribution).text === "Brought to you by MakePay.io — crypto payment gateway.",
       "plugin attribution must match the MakePay text exactly",
@@ -694,7 +932,8 @@ async function main() {
         product_id: commerce.product.id,
         variant_ids: [commerce.variant.id],
         title: commerce.product.title,
-        description: "Mixed ebook, audio, preview, and generated license",
+        handle: `makepay-creator-bundle-${RUN_ID}`,
+        description: "Ebook, studio audio, preview artwork, and generated license",
         status: "draft",
         delivery_type: "mixed",
         fulfillment_strategy: "payment_captured",
@@ -736,7 +975,7 @@ async function main() {
       json: {
         product_config_id: productConfig.id,
         version: "1.0.0",
-        title: "Packed fixture release 1.0.0",
+        title: "Creator Bundle 1.0.0",
         notes: "Created by the isolated packed-plugin lifecycle",
         status: "draft",
         asset_ids: [],
@@ -761,17 +1000,17 @@ async function main() {
     ])
     const ebook = await uploadAsset(
       catalog.release.id,
-      { filename: "makepay-e2e-ebook.pdf", mimeType: "application/pdf", bytes: ebookBytes, purpose: "download" },
+      { filename: "creator-handbook.pdf", mimeType: "application/pdf", bytes: ebookBytes, purpose: "download" },
       true,
     )
     const audio = await uploadAsset(catalog.release.id, {
-      filename: "makepay-e2e-track.mp3",
+      filename: "studio-master.mp3",
       mimeType: "audio/mpeg",
       bytes: audioBytes,
       purpose: "stream",
     })
     const preview = await uploadAsset(catalog.release.id, {
-      filename: "makepay-e2e-preview.png",
+      filename: "creator-bundle-cover.png",
       mimeType: "image/png",
       bytes: previewBytes,
       purpose: "preview",
@@ -850,6 +1089,34 @@ async function main() {
     assertPrivate(foreign.headers)
     assert((await library(customerBToken, order.id)).length === 0, "customer B must not enumerate customer A's order")
     return { order, entitlements, library: customerLibrary }
+  })
+
+  await step("registered-customer delivery emails reach the provider and outbox", async () => {
+    for (const entitlement of customerOrder.entitlements) {
+      const capture = await waitForNotificationCapture({
+        email: customers.customerA.email,
+        entitlementId: entitlement.id,
+        orderId: customerOrder.order.id,
+      })
+      assertRegisteredCapture(capture, `#${customerOrder.order.display_id}`)
+      const delivery = await waitForNotificationState(
+        entitlement.id,
+        (candidate) => candidate.state === "sent",
+        `sent registered-customer delivery ${entitlement.id}`,
+      )
+      assert(
+        Number(delivery.attempt_count) === 1,
+        "registered delivery must complete on its first provider attempt",
+      )
+      assert(
+        typeof delivery.provider_message_id === "string" &&
+          delivery.provider_message_id.startsWith("e2e-email-"),
+        "registered delivery must retain the fixture provider message ID",
+      )
+    }
+    evidence.assertions.registered_delivery_notifications_sent =
+      customerOrder.entitlements.length
+    evidence.assertions.provider_rendered_email_html = true
   })
 
   let lastUsableGrant
@@ -1067,7 +1334,21 @@ async function main() {
     await assertIssueReplay(order.id, automaticEntitlements)
     const [adminEntitlement] = automaticEntitlements
     assert(!adminEntitlement.customer_id, "guest entitlement must not have a customer owner")
-    const guestAccessToken = await guestToken(adminEntitlement.id)
+    const guestCapture = await waitForNotificationCapture({
+      email: guestEmail,
+      entitlementId: adminEntitlement.id,
+      orderId: order.id,
+    })
+    const delivery = await waitForNotificationState(
+      adminEntitlement.id,
+      (candidate) => candidate.state === "sent",
+      `sent guest delivery ${adminEntitlement.id}`,
+    )
+    assert(
+      Number(delivery.attempt_count) === 1,
+      "guest delivery must complete on its first provider attempt",
+    )
+    const guestAccessToken = await consumeGuestCapture(guestCapture)
     const access = await api("/store/digital-downloads/guest/access", {
       method: "POST",
       store: true,
@@ -1105,13 +1386,19 @@ async function main() {
       expected: [401, 403, 404],
     })
     await content(grant, assets.ebook.id, "bytes=8-15", [403, 409])
+    evidence.assertions.guest_delivery_notifications_sent = 1
+    evidence.assertions.guest_capability_consumed_from_provider = true
     return { order, entitlement: adminEntitlement }
   })
 
   const canceledOrder = await step("native order cancellation applies cancellation policy once", async () => {
     const order = await checkout(
       { ...context, variantId: catalog.variant.id },
-      { email: `${RUN_ID}-cancel@digital-downloads.local`, quantity: 1 },
+      {
+        email: customers.customerB.email,
+        customerToken: customerBToken,
+        quantity: 1,
+      },
     )
     const orderResponse = await api(`/admin/orders/${encodeURIComponent(order.id)}`, {
       admin: true,
@@ -1151,6 +1438,87 @@ async function main() {
     return { order, entitlement }
   })
 
+  const showcase = await step("active customer showcase survives a real notification retry", async () => {
+    const customer = await registerCustomer("showcase-retry")
+    const order = await checkout(
+      { ...context, variantId: catalog.variant.id },
+      { email: customer.email, customerToken: customer.token, quantity: 1 },
+    )
+    const [entitlement] = await awaitAutomaticEntitlements(order.id, 1)
+    assert(entitlement, "showcase order must issue one entitlement")
+    await waitForRetryMarker(entitlement.id)
+    const failed = await waitForNotificationState(
+      entitlement.id,
+      (candidate) => candidate.state === "failed",
+      `failed first showcase delivery ${entitlement.id}`,
+    )
+    assert(
+      Number(failed.attempt_count) === 1,
+      "showcase fail-once probe must consume exactly one attempt",
+    )
+    const retried = await retryNotification(entitlement.id)
+    assert(retried.state === "sent", "showcase retry must finish in sent state")
+    assert(
+      Number(retried.attempt_count) === 2,
+      "showcase retry must use exactly one additional attempt",
+    )
+    const capture = await waitForNotificationCapture({
+      email: customer.email,
+      entitlementId: entitlement.id,
+      orderId: order.id,
+    })
+    assertRegisteredCapture(capture, `#${order.display_id}`)
+    const showcaseLibrary = await poll(
+      "active showcase customer library",
+      () => library(customer.token, order.id),
+      (rows) =>
+        rows.length === 1 &&
+        rows[0].status === "active" &&
+        array(rows[0].assets).length >= 2 &&
+        Boolean(record(rows[0].license).id),
+    )
+    const orderDisplayId = String(order.display_id ?? "").trim()
+    assert(/^\d{1,20}$/.test(orderDisplayId), "showcase order must have a display ID")
+    const storefrontPath =
+      `/dk/digital-downloads-e2e?variant_id=${encodeURIComponent(catalog.variant.id)}` +
+      `&order_id=${encodeURIComponent(order.id)}` +
+      `&order_display_id=${encodeURIComponent(orderDisplayId)}`
+    await writeShowcaseCredentials({
+      email: customer.email,
+      password: customer.password,
+      orderDisplayId,
+      orderId: order.id,
+      variantId: catalog.variant.id,
+      storefrontPath,
+    })
+    evidence.assertions.notification_retry_attempts = 2
+    evidence.assertions.showcase_entitlement_active = true
+    return {
+      customer,
+      order,
+      entitlement: showcaseLibrary[0],
+      storefrontPath,
+    }
+  })
+
+  await step("retained notification evidence contains no bearer capability", async () => {
+    const captures = await privateJsonRecords(
+      path.join(NOTIFICATION_CAPTURE_ROOT, "captures"),
+    )
+    assert(captures.length >= 3, "registered delivery evidence must be retained")
+    for (const capture of captures) {
+      assert(
+        !record(capture.value.secret).guest_access_token,
+        "no retained provider capture may contain a guest capability",
+      )
+      assert(
+        !CAPABILITY.test(JSON.stringify(capture.value)),
+        "retained provider captures must remain capability-free",
+      )
+    }
+    evidence.assertions.retained_notification_captures_secret_free = true
+  })
+
   await step("reports and audit projections remain secret-free", async () => {
     const [downloads, audit, report] = await Promise.all([
       api("/admin/digital-downloads/downloads?limit=100", { admin: true }),
@@ -1158,7 +1526,15 @@ async function main() {
       api("/admin/digital-downloads/reports/summary", { admin: true }),
     ])
     const serialized = JSON.stringify([downloads.data, audit.data, report.data])
-    for (const secret of [adminToken, customerAToken, customerBToken, revealedLicenseKey, lastUsableGrant.token]) {
+    for (const secret of [
+      adminToken,
+      customerAToken,
+      customerBToken,
+      showcase.customer.token,
+      showcase.customer.password,
+      revealedLicenseKey,
+      lastUsableGrant.token,
+    ]) {
       assert(!serialized.includes(secret), "operational projections must not contain raw capabilities")
     }
     evidence.assertions.download_event_count = array(record(downloads.data).downloads).length
@@ -1177,6 +1553,11 @@ async function main() {
     customer_order_id: customerOrder.order.id,
     guest_order_id: guestOrder.order.id,
     canceled_order_id: canceledOrder.order.id,
+    showcase_order_id: showcase.order.id,
+    showcase_entitlement_id: showcase.entitlement.id,
+    showcase_customer_email: showcase.customer.email,
+    showcase_storefront_path: showcase.storefrontPath,
+    showcase_credentials_receipt: path.basename(SHOWCASE_CREDENTIAL_PATH),
   }
   evidence.assertions = {
     ...evidence.assertions,

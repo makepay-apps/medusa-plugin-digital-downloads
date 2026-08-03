@@ -14,6 +14,7 @@ import type { DigitalDownloadsClient } from "../client"
 import {
   DigitalDownloadsProvider,
   DigitalLibrary,
+  DigitalOrderDownloads,
   DigitalProductPreviews,
   MAX_BROWSER_GRANT_BYTES,
   MakePayAttribution,
@@ -249,6 +250,55 @@ describe("storefront React primitives", () => {
       token: "grant-secret",
       action: "download",
     })
+  })
+
+  it("renders native order delivery with a friendly reference and an enforced order scope", async () => {
+    const listLibrary = jest.fn(async () => library)
+    const client = createClient({ listLibrary })
+    const queryWithForeignOrder = {
+      order_id: "order_other",
+      status: "active" as const,
+    } as unknown as { status: "active" }
+
+    render(
+      createElement(DigitalOrderDownloads, {
+        client,
+        identityKey: "customer-1",
+        orderDisplayId: 42,
+        orderId: " order_1 ",
+        query: queryWithForeignOrder,
+        showAttribution: false,
+      })
+    )
+
+    expect(
+      screen.getByRole("heading", {
+        name: "Downloads & licenses for order #42",
+      })
+    ).toBeTruthy()
+    await screen.findByText("Ambient collection")
+    expect(screen.getByText("#42")).toBeTruthy()
+    expect(listLibrary).toHaveBeenCalledWith(
+      { order_id: "order_1", status: "active" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+  })
+
+  it("rejects a blank order ID before loading an order library", () => {
+    const error = jest.spyOn(console, "error").mockImplementation(() => undefined)
+    try {
+      expect(() =>
+        render(
+          createElement(DigitalOrderDownloads, {
+            client: createClient(),
+            identityKey: "customer-1",
+            orderId: "   ",
+          })
+        )
+      ).toThrow("orderId is required")
+    } finally {
+      error.mockRestore()
+    }
   })
 
   it("reveals a license only after an explicit buyer action", async () => {

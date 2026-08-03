@@ -55,6 +55,7 @@ describe("digital downloads storefront client", () => {
     )
     const client = createDigitalDownloadsFetchClient({
       baseUrl: "https://medusa.example",
+      publishableKey: "pk_test",
       fetch: fetchMock as typeof fetch,
     })
 
@@ -90,6 +91,7 @@ describe("digital downloads storefront client", () => {
     )
     const client = createDigitalDownloadsFetchClient({
       baseUrl: "https://medusa.example",
+      publishableKey: "pk_test",
       fetch: fetchMock as typeof fetch,
     })
 
@@ -111,7 +113,38 @@ describe("digital downloads storefront client", () => {
       action: "stream",
       method: "GET",
       supports_ranges: true,
-      headers: { authorization: "Bearer short-lived-secret" },
+      headers: {
+        authorization: "Bearer short-lived-secret",
+        "x-publishable-api-key": "pk_test",
+      },
+    })
+  })
+
+  it("supports explicit protected-byte headers without allowing bearer replacement", async () => {
+    const request = jest.fn(async () => ({
+      grant: {
+        token: "short-lived-secret",
+        asset_id: "asset_1",
+        expires_at: "2030-01-01T00:00:00.000Z",
+        url: "/store/digital-downloads/content/asset_1",
+      },
+    }))
+    const client = createDigitalDownloadsClient({
+      transport: {
+        request: <T,>(input: DigitalDownloadsTransportRequest) =>
+          request(input) as Promise<T>,
+      },
+      grantHeaders: async () => ({
+        authorization: "Bearer customer-token-must-not-propagate",
+        "x-publishable-api-key": "pk_custom",
+      }),
+    })
+
+    const { grant } = await client.requestDownloadGrant("ent_1", "asset_1")
+
+    expect(grant.headers).toEqual({
+      authorization: "Bearer short-lived-secret",
+      "x-publishable-api-key": "pk_custom",
     })
   })
 

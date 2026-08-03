@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: Medusa Digital Downloads API
-  version: 0.3.2
+  version: 0.4.0
   summary: Native Medusa v2 APIs for protected digital delivery and licensing.
   description: |
     Admin catalog, storage, entitlement, audit, and reporting APIs plus Store APIs
@@ -797,6 +797,8 @@ paths:
                 notify_existing_customers:
                   type: boolean
                   default: false
+                  enum: [false]
+                  description: Existing-customer release notifications are not supported.
       responses:
         "200":
           description: Published release.
@@ -1954,7 +1956,7 @@ components:
           const: Digital Downloads
         version:
           type: string
-          const: 0.3.2
+          const: 0.4.0
         api_version:
           type: string
           const: "1"
@@ -2516,7 +2518,7 @@ components:
     AdminSettings:
       type: object
       additionalProperties: false
-      required: [enabled, default_delivery_type, default_grant_ttl_seconds, max_grant_ttl_seconds, max_upload_size_bytes, allow_guest_access, require_order_email_match, event_retention_days, storage, signed_url_ttl_seconds, max_upload_size_mb, readiness]
+      required: [enabled, default_delivery_type, default_grant_ttl_seconds, max_grant_ttl_seconds, guest_access_ttl_seconds, max_upload_size_bytes, allow_guest_access, require_order_email_match, event_retention_days, storage, signed_url_ttl_seconds, max_upload_size_mb, readiness]
       properties:
         id:
           $ref: "#/components/schemas/Id"
@@ -2540,6 +2542,12 @@ components:
           type: integer
           minimum: 30
           maximum: 86400
+        guest_access_ttl_seconds:
+          type: integer
+          minimum: 86400
+          maximum: 31536000
+          default: 2592000
+          description: Lifetime of guest purchase-access capabilities, independent of short-lived asset grants.
         max_upload_size_bytes:
           type: integer
           minimum: 1
@@ -2648,6 +2656,10 @@ components:
           type: integer
           minimum: 30
           maximum: 86400
+        guest_access_ttl_seconds:
+          type: integer
+          minimum: 86400
+          maximum: 31536000
         max_upload_size_bytes:
           type: integer
           minimum: 1
@@ -2730,6 +2742,10 @@ components:
           type: string
           minLength: 1
           maxLength: 255
+        handle:
+          type: string
+          minLength: 1
+          maxLength: 255
         description:
           type: [string, "null"]
           maxLength: 10000
@@ -2785,6 +2801,10 @@ components:
           type: string
           minLength: 1
           maxLength: 255
+        handle:
+          type: string
+          minLength: 1
+          maxLength: 255
         description:
           type: [string, "null"]
           maxLength: 10000
@@ -2836,6 +2856,8 @@ components:
             $ref: "#/components/schemas/Id"
         title:
           type: string
+        handle:
+          type: [string, "null"]
         description:
           type: [string, "null"]
         status:
@@ -3285,6 +3307,13 @@ components:
         rotate_guest_token:
           type: boolean
           default: true
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            Replacement deadline. Omit to renew a past deadline using the
+            entitlement's recorded purchase term; null explicitly removes
+            expiry. A supplied timestamp must be in the future.
     DownloadEventPage:
       allOf:
         - $ref: "#/components/schemas/Page"

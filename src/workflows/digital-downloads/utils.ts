@@ -26,6 +26,13 @@ const SECRET_FIELDS = new Set([
   "absolute_path",
   "token",
 ])
+const SECRET_FIELD_PATTERN =
+  /(^|_)(?:access_key(?:_id)?|api_key|authorization|bearer|client_secret|credentials?|license_key|password|private_key|refresh_token|secret(?:_access_key)?|session_token|storage_key|token(?:_hash)?)(?:_|$)/i
+const MAX_SNAPSHOT_DEPTH = 6
+const MAX_SNAPSHOT_NODES = 512
+const MAX_SNAPSHOT_COLLECTION_ITEMS = 64
+const MAX_SNAPSHOT_STRING_BYTES = 2_048
+const MAX_SNAPSHOT_VALUE_BYTES = 48 * 1_024
 
 export function requireIdentifier(
   input: UnknownRecord,
@@ -112,33 +119,102 @@ export function stripManagedFields<T extends UnknownRecord>(
   return output
 }
 
-export function sanitizeForPurchaseSnapshot(value: unknown): any {
+type SnapshotBudget = {
+  bytes: number
+  nodes: number
+  seen: WeakSet<object>
+}
+
+function boundedSnapshotString(
+  value: string,
+  budget: SnapshotBudget,
+  maxBytes = MAX_SNAPSHOT_STRING_BYTES,
+): string {
+  const available = Math.max(
+    0,
+    Math.min(maxBytes, MAX_SNAPSHOT_VALUE_BYTES - budget.bytes),
+  )
+  if (!available) return ""
+  const encoded = Buffer.from(value, "utf8")
+  const output = encoded.length <= available
+    ? value
+    : encoded.subarray(0, available).toString("utf8").replace(/\uFFFD$/u, "")
+  budget.bytes += Buffer.byteLength(output, "utf8")
+  return output
+}
+
+function sanitizeSnapshotValue(
+  value: unknown,
+  depth: number,
+  budget: SnapshotBudget,
+): any {
+  if (
+    budget.nodes >= MAX_SNAPSHOT_NODES ||
+    budget.bytes >= MAX_SNAPSHOT_VALUE_BYTES ||
+    depth > MAX_SNAPSHOT_DEPTH
+  ) {
+    return null
+  }
+  budget.nodes += 1
+
   if (value === null || value === undefined) {
     return value ?? null
   }
 
   if (value instanceof Date) {
-    return value.toISOString()
+    return boundedSnapshotString(value.toISOString(), budget)
   }
+
+  if (typeof value === "string") {
+    return boundedSnapshotString(value, budget)
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null
+  }
+  if (typeof value === "bigint") {
+    return boundedSnapshotString(value.toString(), budget)
+  }
+  if (typeof value === "boolean") {
+    return value
+  }
+  if (typeof value !== "object") return null
+
+  if (budget.seen.has(value)) return null
+  budget.seen.add(value)
 
   if (Array.isArray(value)) {
-    return value.map(sanitizeForPurchaseSnapshot)
-  }
-
-  if (typeof value !== "object") {
-    return value
+    const result = value
+      .slice(0, MAX_SNAPSHOT_COLLECTION_ITEMS)
+      .map((entry) => sanitizeSnapshotValue(entry, depth + 1, budget))
+    budget.seen.delete(value)
+    return result
   }
 
   const result: UnknownRecord = {}
-  for (const [key, entry] of Object.entries(value as UnknownRecord)) {
-    if (SECRET_FIELDS.has(key.toLowerCase())) {
+  const entries = Object.entries(value as UnknownRecord).slice(
+    0,
+    MAX_SNAPSHOT_COLLECTION_ITEMS,
+  )
+  for (const [rawKey, entry] of entries) {
+    const lowerKey = rawKey.toLowerCase()
+    if (SECRET_FIELDS.has(lowerKey) || SECRET_FIELD_PATTERN.test(lowerKey)) {
       continue
     }
-
-    result[key] = sanitizeForPurchaseSnapshot(entry)
+    const key = boundedSnapshotString(rawKey, budget, 128)
+    if (!key || budget.bytes >= MAX_SNAPSHOT_VALUE_BYTES) break
+    result[key] = sanitizeSnapshotValue(entry, depth + 1, budget)
   }
-
+  budget.seen.delete(value)
   return result
+}
+
+export function sanitizeForPurchaseSnapshot(value: unknown): any {
+  return sanitizeSnapshotValue(value, 0, {
+    bytes: 0,
+    nodes: 0,
+    seen: new WeakSet(),
+  })
 }
 
 export function selectPurchasableRelease(
@@ -194,6 +270,7 @@ export function buildPurchaseSnapshot(input: {
     purchased_at: order.created_at ?? new Date(0).toISOString(),
     order: {
       id: order.id,
+      display_id: order.display_id,
       currency_code: order.currency_code,
       region_id: order.region_id,
     },
@@ -206,7 +283,6 @@ export function buildPurchaseSnapshot(input: {
       product_id: lineItem.product_id,
       variant_id: lineItem.variant_id,
       unit_price: lineItem.unit_price,
-      metadata: lineItem.metadata ?? {},
     },
     digital_product: {
       id: digitalProduct.id,
@@ -216,14 +292,12 @@ export function buildPurchaseSnapshot(input: {
         digitalProduct.delivery_mode ?? digitalProduct.delivery_type,
       download_limit: digitalProduct.download_limit,
       access_duration: digitalProduct.access_duration,
-      metadata: digitalProduct.metadata ?? {},
     },
     release: release
       ? {
           id: release.id,
           version: release.version ?? release.name,
           published_at: release.published_at ?? release.released_at,
-          metadata: release.metadata ?? {},
         }
       : null,
     assets: (Array.isArray(selectedAssets) ? selectedAssets : []).map(
@@ -241,10 +315,20 @@ export function buildPurchaseSnapshot(input: {
         checksum:
           asset.checksum ?? asset.sha256 ?? asset.checksum_sha256,
         role: asset.role,
-        metadata: asset.public_metadata ?? asset.metadata ?? {},
       })
     ),
-    license_policy: digitalProduct.license_policy ?? release?.license_policy ?? null,
+    license_policy: (() => {
+      const policy = digitalProduct.license_policy ?? release?.license_policy
+      return policy
+        ? {
+            id: policy.id,
+            strategy: policy.strategy ?? policy.type,
+            activation_limit:
+              policy.activation_limit ?? policy.max_activations,
+            require_device_id: policy.require_device_id,
+          }
+        : null
+    })(),
   })
 }
 

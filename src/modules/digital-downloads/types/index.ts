@@ -213,6 +213,8 @@ export interface DigitalDownloadsModuleOptions {
   defaultDownloadLimit?: number | null
   defaultGrantTtlSeconds?: number
   maxGrantTtlSeconds?: number
+  /** Lifetime of guest purchase-access capabilities; independent of asset grants. */
+  guestAccessTtlSeconds?: number
   maxUploadSizeBytes?: number
   allowedMimeTypes?: string[]
   allowGuestAccess?: boolean
@@ -239,6 +241,7 @@ export interface ResolvedDigitalDownloadsModuleOptions {
   defaultDownloadLimit: number | null
   defaultGrantTtlSeconds: number
   maxGrantTtlSeconds: number
+  guestAccessTtlSeconds: number
   maxUploadSizeBytes: number
   allowedMimeTypes: string[]
   allowGuestAccess: boolean
@@ -292,6 +295,8 @@ export interface IssueEntitlementRowInput {
   license_activation_limit?: number | null
   snapshot?: JsonObject
   metadata?: JsonObject
+  /** Internal orchestration control. Omitted values preserve direct-call behavior. */
+  create_guest_access?: boolean
 }
 
 export interface IssueOrderEntitlementsInput {
@@ -301,6 +306,71 @@ export interface IssueOrderEntitlementsInput {
   customer_email: string
   customer_name?: string | null
   items: IssueOrderEntitlementItemInput[]
+}
+
+export interface ReissueEntitlementInput {
+  entitlementId?: string
+  entitlement_id?: string
+  reason?: string
+  reset_downloads?: boolean
+  rotate_guest_token?: boolean
+  /**
+   * Optional replacement deadline. Omission renews a past deadline using the
+   * entitlement's recorded purchase term; null explicitly removes expiry.
+   */
+  expires_at?: Date | string | null
+  expiresAt?: Date | string | null
+  /** Internal workflow control: defer guest-capability creation to notification delivery. */
+  create_guest_access?: boolean
+  notify?: boolean
+}
+
+export interface RevokeEntitlementWithNotificationInput {
+  entitlement_id: string
+  reason: string
+  actor?: { type?: string; id?: string }
+  notify?: boolean
+  final_status?: DigitalEntitlementStatus.REVOKED | DigitalEntitlementStatus.REFUNDED
+}
+
+export interface RevokeOrderEntitlementsInput {
+  order_id: string
+  line_item_ids?: string[]
+  reason: string
+  trigger?: "refund" | "cancellation" | "chargeback" | "manual"
+  notify?: boolean
+  actor?: { type?: string; id?: string }
+}
+
+export interface ListLifecycleNotificationRepairCandidatesInput {
+  /** Bounded maintenance batch size. */
+  limit?: number
+  /** Stable upper bound for rows visible to this maintenance run. */
+  as_of?: Date | string
+}
+
+export interface LifecycleNotificationRepairCandidate {
+  id: string
+  status:
+    | DigitalEntitlementStatus.EXPIRED
+    | DigitalEntitlementStatus.REVOKED
+    | DigitalEntitlementStatus.REFUNDED
+  reason: string
+}
+
+export interface ExpireEntitlementIfDueInput {
+  entitlement_id: string
+  as_of: Date | string
+  reason?: string
+}
+
+export interface RepairLifecycleNotificationInput {
+  entitlement_id: string
+  expected_status:
+    | DigitalEntitlementStatus.EXPIRED
+    | DigitalEntitlementStatus.REVOKED
+    | DigitalEntitlementStatus.REFUNDED
+  reason: string
 }
 
 export interface CreateDownloadGrantInput {
@@ -362,6 +432,8 @@ export interface AssignLicenseKeyInput {
   license_policy_id: string
   idempotency_key: string
   external_key?: string
+  /** Internal reissue control: rotate an otherwise active assignment. */
+  replace_existing?: boolean
   metadata?: JsonObject
 }
 
@@ -379,11 +451,42 @@ export interface CreateGuestAccessSessionInput {
   idempotency_key: string
   /** Internal delivery state; public issuance defaults to active. */
   initial_status?: AccessSessionStatus.ACTIVE | AccessSessionStatus.PENDING
+  /** Internal generation fence used by notification delivery. */
+  expected_guest_access_epoch?: number
   ttl_seconds?: number
   bind_ip?: string
   bind_user_agent?: string
   metadata?: JsonObject
 }
+
+export interface ActivateGuestAccessSessionInput {
+  /** Internal generation fence used by notification delivery. */
+  expected_guest_access_epoch?: number
+  /** Binds notification-created sessions to their owning outbox row. */
+  notification_delivery_id?: string
+}
+
+export interface FinalizeNotificationGuestAccessInput {
+  delivery_id: string
+  entitlement_id: string
+  session_id: string
+  expected_guest_access_epoch: number
+  worker_id: string
+  attempt: number
+  provider_message_id?: string | null
+}
+
+export type FinalizeNotificationGuestAccessResult =
+  | {
+      outcome: "sent"
+      delivery: Record<string, unknown>
+      session: Record<string, unknown>
+    }
+  | {
+      outcome: "superseded"
+      delivery: Record<string, unknown>
+      session: Record<string, unknown>
+    }
 
 export interface LicenseKeyClientInput {
   license_key: string

@@ -12,6 +12,9 @@ import { sha256 } from "./crypto"
 const MEBIBYTE = 1024 * 1024
 const MAX_UPLOAD_SIZE = 1024 * 1024 * MEBIBYTE
 const MAX_GRANT_TTL_SECONDS = 7 * 24 * 60 * 60
+export const MIN_GUEST_ACCESS_TTL_SECONDS = 24 * 60 * 60
+export const DEFAULT_GUEST_ACCESS_TTL_SECONDS = 30 * 24 * 60 * 60
+export const MAX_GUEST_ACCESS_TTL_SECONDS = 365 * 24 * 60 * 60
 const DEFAULT_MAX_UPLOAD_SIZE = 5 * 1024 * MEBIBYTE
 const REVOCATION_POLICIES = new Set<RevocationPolicy>([
   "retain",
@@ -193,6 +196,14 @@ export function resolveDigitalDownloadsOptions(
     "maxGrantTtlSeconds",
     { min: defaultGrantTtlSeconds, max: MAX_GRANT_TTL_SECONDS },
   )
+  const guestAccessTtlSeconds = integer(
+    options.guestAccessTtlSeconds ?? DEFAULT_GUEST_ACCESS_TTL_SECONDS,
+    "guestAccessTtlSeconds",
+    {
+      min: MIN_GUEST_ACCESS_TTL_SECONDS,
+      max: MAX_GUEST_ACCESS_TTL_SECONDS,
+    },
+  )
   const defaultDownloadLimit =
     options.defaultDownloadLimit === null
       ? null
@@ -252,6 +263,7 @@ export function resolveDigitalDownloadsOptions(
     defaultDownloadLimit,
     defaultGrantTtlSeconds,
     maxGrantTtlSeconds,
+    guestAccessTtlSeconds,
     maxUploadSizeBytes,
     allowedMimeTypes: normalizeMimeTypes(options.allowedMimeTypes),
     allowGuestAccess: options.allowGuestAccess ?? true,

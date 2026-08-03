@@ -164,6 +164,14 @@ function entityResult(value: unknown, keys: string[]) {
   return safeAdmin(unwrapResult(value, keys))
 }
 
+function deliveryTypeForAssetRole(
+  role: "download" | "stream" | "preview" | "cover" | "manual" | "license",
+): "download" | "stream" | "license" {
+  if (role === "stream") return "stream"
+  if (role === "license") return "license"
+  return "download"
+}
+
 function objectValue(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -255,6 +263,7 @@ function adminSettingsProjection(
     "default_download_limit",
     "default_grant_ttl_seconds",
     "max_grant_ttl_seconds",
+    "guest_access_ttl_seconds",
     "max_upload_size_bytes",
     "allow_guest_access",
     "require_order_email_match",
@@ -321,6 +330,7 @@ export async function patchSettings(req: MedusaRequest, res: MedusaResponse) {
     "default_delivery_type",
     "allow_guest_access",
     "require_order_email_match",
+    "guest_access_ttl_seconds",
     "metadata",
   ] as const) {
     if (input[key] !== undefined) normalized[key] = input[key]
@@ -682,7 +692,12 @@ export async function patchAsset(req: MedusaRequest, res: MedusaResponse) {
       ? { original_filename: patch.filename }
       : {}),
     ...(patch.mime_type !== undefined ? { mime_type: patch.mime_type } : {}),
-    ...(patch.role !== undefined ? { role: patch.role } : {}),
+    ...(patch.role !== undefined
+      ? {
+          role: patch.role,
+          delivery_type: deliveryTypeForAssetRole(patch.role),
+        }
+      : {}),
     ...(patch.sort_order !== undefined ? { sort_order: patch.sort_order } : {}),
     ...(Object.keys(metadata).length ? { metadata } : {}),
   })
@@ -1027,6 +1042,9 @@ export async function reissueEntitlement(req: MedusaRequest, res: MedusaResponse
       notify: input.notify,
       reset_downloads: input.reset_downloads,
       rotate_guest_token: input.rotate_guest_token,
+      ...(input.expires_at !== undefined
+        ? { expires_at: input.expires_at }
+        : {}),
     },
   })
   res.set(PRIVATE_NO_STORE_HEADERS).json({

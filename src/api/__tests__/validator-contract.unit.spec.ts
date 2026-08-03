@@ -1,6 +1,9 @@
 import {
   LibraryQuerySchema,
   LicensePolicyInputSchema,
+  ProductConfigInputSchema,
+  PublishReleaseSchema,
+  ReissueEntitlementSchema,
   SettingsPatchSchema,
   UploadCompleteSchema,
   UploadInputSchema,
@@ -17,10 +20,36 @@ describe("frozen API validation contract", () => {
     expect(
       SettingsPatchSchema.safeParse({
         signed_url_ttl_seconds: 600,
+        guest_access_ttl_seconds: 2_592_000,
         max_upload_size_mb: 512,
         audit_retention_days: 365,
       }).success,
     ).toBe(true)
+    expect(
+      SettingsPatchSchema.safeParse({ guest_access_ttl_seconds: 86_399 })
+        .success,
+    ).toBe(false)
+    expect(
+      SettingsPatchSchema.safeParse({ guest_access_ttl_seconds: 31_536_001 })
+        .success,
+    ).toBe(false)
+  })
+
+  it("rejects unsupported existing-customer release notifications", () => {
+    expect(PublishReleaseSchema.safeParse({}).success).toBe(true)
+    expect(
+      PublishReleaseSchema.safeParse({ notify_existing_customers: false })
+        .success,
+    ).toBe(true)
+    const rejected = PublishReleaseSchema.safeParse({
+      notify_existing_customers: true,
+    })
+    expect(rejected.success).toBe(false)
+    if (!rejected.success) {
+      expect(rejected.error.issues[0]?.message).toBe(
+        "notify_existing_customers is not supported",
+      )
+    }
   })
 
   it("supports only implemented licensing strategies and online activation", () => {
@@ -40,6 +69,42 @@ describe("frozen API validation contract", () => {
         strategy: "generated",
         allow_offline_activation: true,
       }).success,
+    ).toBe(false)
+  })
+
+  it("accepts an explicit internal product-config handle", () => {
+    const input = {
+      product_id: "prod_1",
+      variant_ids: ["variant_1"],
+      title: "MakePay Creator Bundle",
+      handle: "makepay-creator-bundle-run-1",
+      delivery_type: "mixed" as const,
+    }
+
+    expect(ProductConfigInputSchema.safeParse(input).success).toBe(true)
+    expect(
+      ProductConfigInputSchema.safeParse({ ...input, handle: "" }).success,
+    ).toBe(false)
+    expect(
+      ProductConfigInputSchema.safeParse({
+        ...input,
+        handle: "x".repeat(256),
+      }).success,
+    ).toBe(false)
+  })
+
+  it("accepts only explicit ISO deadlines or null for entitlement reissue", () => {
+    expect(ReissueEntitlementSchema.safeParse({}).success).toBe(true)
+    expect(
+      ReissueEntitlementSchema.safeParse({
+        expires_at: "2026-08-04T12:00:00.000Z",
+      }).success,
+    ).toBe(true)
+    expect(
+      ReissueEntitlementSchema.safeParse({ expires_at: null }).success,
+    ).toBe(true)
+    expect(
+      ReissueEntitlementSchema.safeParse({ expires_at: "tomorrow" }).success,
     ).toBe(false)
   })
 

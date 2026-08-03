@@ -1,0 +1,227 @@
+export type DigitalDownloadEmailOptions = {
+  storefrontBaseUrl: string
+  accountLibraryPath?: string
+  orderDetailsPathTemplate?: string
+  guestAccessPath?: string
+}
+
+export type RenderedDigitalDownloadEmail = {
+  subject: string
+  text: string
+  html: string
+}
+
+const TEMPLATE_IDS = new Set([
+  "digital-downloads-delivery",
+  "digital-downloads-revoked",
+  "digital-downloads-reissued",
+  "digital-downloads-expired",
+])
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+}
+
+function safeText(value: unknown, fallback: string, max = 300): string {
+  if (typeof value !== "string") return fallback
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim()
+  return normalized ? normalized.slice(0, max) : fallback
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;")
+}
+
+function storefrontUrl(baseUrl: string, path: string): URL {
+  const base = new URL(baseUrl)
+  if (base.protocol !== "https:") {
+    throw new Error("storefrontBaseUrl must use HTTPS")
+  }
+  if (base.username || base.password) {
+    throw new Error("storefrontBaseUrl must not contain credentials")
+  }
+  const target = new URL(path, base)
+  if (target.username || target.password) {
+    throw new Error("Digital download email paths must not contain credentials")
+  }
+  if (target.origin !== base.origin) {
+    throw new Error("Digital download email paths must remain on the storefront origin")
+  }
+  return target
+}
+
+function orderDetailsPathTemplate(options: DigitalDownloadEmailOptions): string {
+  const template =
+    options.orderDetailsPathTemplate ?? "/account/orders/details/{order_id}"
+  if (template.split("{order_id}").length !== 2) {
+    throw new Error(
+      "orderDetailsPathTemplate must contain exactly one {order_id} placeholder"
+    )
+  }
+  return template
+}
+
+/**
+ * Validate URL configuration at application startup, before a queued email
+ * reaches the provider. This is also a small, dependency-free self-check that
+ * host applications can exercise in their own configuration tests.
+ */
+export function validateDigitalDownloadEmailOptions(
+  options: DigitalDownloadEmailOptions
+): void {
+  storefrontUrl(
+    options.storefrontBaseUrl,
+    options.accountLibraryPath ?? "/account/downloads"
+  )
+  storefrontUrl(
+    options.storefrontBaseUrl,
+    options.guestAccessPath ?? "/digital-access"
+  )
+  storefrontUrl(
+    options.storefrontBaseUrl,
+    orderDetailsPathTemplate(options).replace("{order_id}", "order_self_check")
+  )
+}
+
+function entitlementTitle(data: Record<string, unknown>): string {
+  const entitlement = record(data.entitlement)
+  const product = record(entitlement.product)
+  const lineItem = record(entitlement.line_item)
+  const digitalProduct = record(entitlement.digital_product)
+  return safeText(
+    product.title ?? lineItem.title ?? digitalProduct.name,
+    "your digital purchase"
+  )
+}
+
+function safeOrderId(data: Record<string, unknown>): string | undefined {
+  const entitlement = record(data.entitlement)
+  const value = data.order_id ?? entitlement.order_id
+  if (typeof value !== "string") return undefined
+  const normalized = value.trim()
+  if (
+    !normalized ||
+    normalized.length > 255 ||
+    /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
+    return undefined
+  }
+  return normalized
+}
+
+function encodePathSegment(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  )
+}
+
+function destination(
+  data: Record<string, unknown>,
+  options: DigitalDownloadEmailOptions
+): URL {
+  const token =
+    typeof data.guest_access_token === "string"
+      ? data.guest_access_token
+      : record(data.guest_access).token
+  if (typeof token === "string" && token.length >= 16) {
+    const target = storefrontUrl(
+      options.storefrontBaseUrl,
+      options.guestAccessPath ?? "/digital-access"
+    )
+    target.hash = new URLSearchParams({ token }).toString()
+    return target
+  }
+
+  const orderId = safeOrderId(data)
+  if (orderId) {
+    const path = orderDetailsPathTemplate(options).replace(
+      "{order_id}",
+      encodePathSegment(orderId)
+    )
+    return storefrontUrl(options.storefrontBaseUrl, path)
+  }
+
+  return storefrontUrl(
+    options.storefrontBaseUrl,
+    options.accountLibraryPath ?? "/account/downloads"
+  )
+}
+
+function emailDocument(input: {
+  heading: string
+  message: string
+  action?: { label: string; url: URL }
+}): Pick<RenderedDigitalDownloadEmail, "text" | "html"> {
+  const actionText = input.action
+    ? `\n\n${input.action.label}: ${input.action.url.toString()}`
+    : ""
+  const actionHtml = input.action
+    ? `<p><a href="${escapeHtml(input.action.url.toString())}">${escapeHtml(
+        input.action.label
+      )}</a></p>`
+    : ""
+  return {
+    text: `${input.heading}\n\n${input.message}${actionText}`,
+    html: `<main><h1>${escapeHtml(input.heading)}</h1><p>${escapeHtml(
+      input.message
+    )}</p>${actionHtml}</main>`,
+  }
+}
+
+export function renderDigitalDownloadEmail(
+  template: string,
+  rawData: Record<string, unknown>,
+  options: DigitalDownloadEmailOptions
+): RenderedDigitalDownloadEmail {
+  validateDigitalDownloadEmailOptions(options)
+  if (!TEMPLATE_IDS.has(template)) {
+    throw new Error(`Unsupported digital download email template: ${template}`)
+  }
+
+  const title = entitlementTitle(rawData)
+  const reason = safeText(rawData.reason, "the order status changed", 500)
+  if (template === "digital-downloads-delivery") {
+    const content = emailDocument({
+      heading: "Your digital purchase is ready",
+      message: `${title} is now available. Open your secure digital library to download files or reveal an assigned license.`,
+      action: {
+        label: "Open digital library",
+        url: destination(rawData, options),
+      },
+    })
+    return { subject: "Your digital purchase is ready", ...content }
+  }
+
+  if (template === "digital-downloads-reissued") {
+    const content = emailDocument({
+      heading: "Your digital access has been restored",
+      message: `Access to ${title} has been reissued.`,
+      action: {
+        label: "Open digital library",
+        url: destination(rawData, options),
+      },
+    })
+    return { subject: "Your digital access has been restored", ...content }
+  }
+
+  if (template === "digital-downloads-revoked") {
+    const content = emailDocument({
+      heading: "Your digital access changed",
+      message: `Access to ${title} was revoked because ${reason}. Contact the store if you believe this is incorrect.`,
+    })
+    return { subject: "Your digital access changed", ...content }
+  }
+
+  const content = emailDocument({
+    heading: "Your digital access expired",
+    message: `The access period for ${title} has ended. Contact the store if you need help.`,
+  })
+  return { subject: "Your digital access expired", ...content }
+}

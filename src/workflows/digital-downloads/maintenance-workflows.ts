@@ -12,7 +12,6 @@ import {
 } from "@medusajs/framework/utils"
 import {
   DigitalEntitlementStatus,
-  NotificationDeliveryState,
 } from "../../modules/digital-downloads/types"
 import { DIGITAL_DOWNLOAD_EVENTS } from "./events"
 import {
@@ -220,48 +219,49 @@ const expireEntitlementsStep = createStep(
       },
       { take: limit, order: { expires_at: "ASC" } }
     )
+    const repairCandidates =
+      await service.listLifecycleNotificationRepairCandidates({
+        limit,
+        as_of: asOf,
+      })
     const expired: UnknownRecord[] = []
+    const repaired: UnknownRecord[] = []
     const notificationEvents: UnknownRecord[] = []
 
     for (const candidate of candidates) {
-      let entitlement = await service.revokeEntitlement(
-        candidate.id,
-        "Entitlement access period expired",
-        { type: "scheduled_job", id: "expire-entitlements" }
-      )
-      entitlement = await service.updateDigitalEntitlements({
-        id: candidate.id,
-        status: DigitalEntitlementStatus.EXPIRED,
+      const result = await service.expireEntitlementIfDue({
+        entitlement_id: candidate.id,
+        as_of: asOf,
+        reason: "Entitlement access period expired",
       })
+      if (!result.expired) {
+        continue
+      }
+      const entitlement = result.entitlement
       expired.push(entitlement)
+      if (result.delivery) {
+        notificationEvents.push({ delivery_id: result.delivery.id })
+      }
+    }
 
-      if (entitlement.customer_email) {
-        const idempotencyKey = `${entitlement.id}:expired:v1`
-        const existing = await service.listNotificationDeliveries(
-          { idempotency_key: idempotencyKey },
-          { take: 1 }
-        )
-        const delivery = existing[0] ??
-          (await service.createNotificationDeliveries({
-            entitlement_id: entitlement.id,
-            idempotency_key: idempotencyKey,
-            channel: "email",
-            template: "digital-downloads-expired",
-            recipient_hash: await service.recipientHash(
-              entitlement.customer_email
-            ),
-            state: NotificationDeliveryState.PENDING,
-            attempt_count: 0,
-            max_attempts: 8,
-            payload: { entitlement_id: entitlement.id, order_id: entitlement.order_id },
-            metadata: {},
-          }))
-        notificationEvents.push({ delivery_id: delivery.id })
+    for (const candidate of repairCandidates) {
+      const result = await service.repairLifecycleNotification({
+        entitlement_id: candidate.id,
+        expected_status: candidate.status,
+        reason: candidate.reason,
+      })
+      if (!result.repaired) {
+        continue
+      }
+      repaired.push(result.entitlement)
+      if (result.delivery) {
+        notificationEvents.push({ delivery_id: result.delivery.id })
       }
     }
 
     return new StepResponse({
       expired,
+      repaired,
       notification_events: notificationEvents,
       as_of: asOf.toISOString(),
     })

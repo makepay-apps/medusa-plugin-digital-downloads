@@ -90,6 +90,7 @@ export const ProductConfigInputSchema = z
     product_id: IdSchema,
     variant_ids: z.array(IdSchema).min(1).max(100),
     title: z.string().trim().min(1).max(255),
+    handle: z.string().trim().min(1).max(255).optional(),
     description: z.string().trim().max(10_000).nullable().optional(),
     status: z.enum(["draft", "active", "archived"]).default("draft"),
     delivery_type: z.enum(["download", "stream", "license", "mixed"]),
@@ -146,7 +147,12 @@ export const ReleasePatchSchema = ReleaseInputSchema.omit({
 export const PublishReleaseSchema = z
   .object({
     make_active: z.boolean().default(true),
-    notify_existing_customers: z.boolean().default(false),
+    notify_existing_customers: z
+      .boolean()
+      .refine((value) => value === false, {
+        message: "notify_existing_customers is not supported",
+      })
+      .default(false),
   })
   .strict()
 
@@ -259,6 +265,12 @@ export const SettingsPatchSchema = z
       .min(30)
       .max(86_400)
       .optional(),
+    guest_access_ttl_seconds: z
+      .number()
+      .int()
+      .min(86_400)
+      .max(31_536_000)
+      .optional(),
     max_upload_size_bytes: z
       .number()
       .int()
@@ -355,6 +367,7 @@ export const ReissueEntitlementSchema = z
     notify: z.boolean().default(true),
     reset_downloads: z.boolean().default(false),
     rotate_guest_token: z.boolean().default(true),
+    expires_at: z.string().datetime({ offset: true }).nullable().optional(),
   })
   .strict()
 

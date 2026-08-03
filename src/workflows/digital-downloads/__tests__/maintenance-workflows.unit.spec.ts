@@ -8,6 +8,7 @@ import { DIGITAL_DOWNLOADS_MODULE } from "../../../modules/digital-downloads"
 import {
   cleanupDigitalVariantWorkflow,
   cleanupOrphanedDigitalProductsWorkflow,
+  expireEntitlementsWorkflow,
   retryNotificationDeliveriesWorkflow,
 } from "../maintenance-workflows"
 
@@ -32,6 +33,11 @@ function maintenanceContainer(input: {
     [ContainerRegistrationKeys.LINK]: asValue(remoteLink),
     [ContainerRegistrationKeys.LOGGER]: asValue(logger),
     [ContainerRegistrationKeys.QUERY]: asValue(input.query ?? {}),
+    [Modules.EVENT_BUS]: asValue({
+      emit: jest.fn().mockResolvedValue(undefined),
+      clearGroupedEvents: jest.fn().mockResolvedValue(undefined),
+      releaseGroupedEvents: jest.fn().mockResolvedValue(undefined),
+    }),
     [DIGITAL_DOWNLOADS_MODULE]: asValue(input.service),
   })
   return { container, remoteLink }
@@ -158,6 +164,122 @@ describe("digital notification retry maintenance", () => {
         { delivery_id: "ndel_2" },
       ],
       stale_delivery_ids: [],
+    })
+  })
+})
+
+describe("entitlement expiry maintenance", () => {
+  it("uses the atomic expiry/outbox service operation", async () => {
+    const candidate = {
+      id: "dent_due",
+      status: "active",
+      expires_at: "2026-08-01T05:00:00.000Z",
+    }
+    const service = {
+      listDigitalEntitlements: jest.fn().mockResolvedValue([candidate]),
+      listLifecycleNotificationRepairCandidates: jest
+        .fn()
+        .mockResolvedValue([]),
+      expireEntitlementIfDue: jest.fn().mockResolvedValue({
+        entitlement: { ...candidate, status: "expired" },
+        delivery: { id: "ndel_expired" },
+        expired: true,
+      }),
+    }
+    const { container } = maintenanceContainer({
+      linkService: { list: jest.fn() },
+      service,
+    })
+
+    const { result } = await expireEntitlementsWorkflow(container).run({
+      input: { as_of: "2026-08-01T06:00:00.000Z", limit: 10 },
+      context: { transactionId: "test:expiry:atomic-outbox" },
+    })
+
+    expect(service.listDigitalEntitlements).toHaveBeenCalledWith(
+      {
+        status: "active",
+        expires_at: { $lte: new Date("2026-08-01T06:00:00.000Z") },
+      },
+      { take: 10, order: { expires_at: "ASC" } },
+    )
+    expect(service.expireEntitlementIfDue).toHaveBeenCalledWith({
+      entitlement_id: candidate.id,
+      as_of: new Date("2026-08-01T06:00:00.000Z"),
+      reason: "Entitlement access period expired",
+    })
+    expect(
+      service.listLifecycleNotificationRepairCandidates,
+    ).toHaveBeenCalledWith({
+      limit: 10,
+      as_of: new Date("2026-08-01T06:00:00.000Z"),
+    })
+    expect(result).toMatchObject({
+      expired: [{ id: candidate.id, status: "expired" }],
+      repaired: [],
+      notification_events: [{ delivery_id: "ndel_expired" }],
+    })
+  })
+
+  it("repairs a bounded terminal lifecycle batch through the status-guarded atomic primitive", async () => {
+    const repairCandidates = [
+      {
+        id: "dent_expired_legacy",
+        status: "expired",
+        reason: "Entitlement access period expired",
+      },
+      {
+        id: "dent_refunded_legacy",
+        status: "refunded",
+        reason: "Order refunded",
+      },
+    ]
+    const service = {
+      listDigitalEntitlements: jest.fn().mockResolvedValue([]),
+      listLifecycleNotificationRepairCandidates: jest
+        .fn()
+        .mockResolvedValue(repairCandidates),
+      repairLifecycleNotification: jest
+        .fn()
+        .mockResolvedValueOnce({
+          entitlement: { id: "dent_expired_legacy", status: "expired" },
+          delivery: { id: "ndel_expired_repair" },
+          repaired: true,
+        })
+        .mockResolvedValueOnce({
+          entitlement: { id: "dent_refunded_legacy", status: "active" },
+          repaired: false,
+        }),
+    }
+    const { container } = maintenanceContainer({
+      linkService: { list: jest.fn() },
+      service,
+    })
+
+    const { result } = await expireEntitlementsWorkflow(container).run({
+      input: { as_of: "2026-08-01T06:00:00.000Z", limit: 5_000 },
+      context: { transactionId: "test:lifecycle:bounded-repair" },
+    })
+
+    expect(
+      service.listLifecycleNotificationRepairCandidates,
+    ).toHaveBeenCalledWith({
+      limit: 1_000,
+      as_of: new Date("2026-08-01T06:00:00.000Z"),
+    })
+    expect(service.repairLifecycleNotification.mock.calls).toEqual(
+      repairCandidates.map((candidate) => [
+        {
+          entitlement_id: candidate.id,
+          expected_status: candidate.status,
+          reason: candidate.reason,
+        },
+      ]),
+    )
+    expect(result).toMatchObject({
+      expired: [],
+      repaired: [{ id: "dent_expired_legacy", status: "expired" }],
+      notification_events: [{ delivery_id: "ndel_expired_repair" }],
     })
   })
 })

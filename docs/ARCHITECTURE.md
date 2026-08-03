@@ -75,8 +75,16 @@ channels, tax, and normal catalog state remain in Medusa's Product Module.
 
 An immutable version boundary. Draft releases may be edited; publication fixes
 the release identity used in purchase snapshots. Superseding a release does not
-rewrite existing entitlements. The update policy decides whether an entitlement
-can also see newer releases.
+rewrite existing entitlements. `update_policy` is reserved and recorded for a
+future explicit upgrade workflow; v0.4 entitlements remain pinned to their
+purchased release.
+
+Every delivery mode, including license-only, requires this published boundary
+before fulfillment. Download/stream/mixed publication validates its ready asset
+set. A license-only release may contain zero assets when an enabled generated
+or pooled license policy supplies the deliverable. Existing-entitlement
+notification during publication is rejected until explicit update-policy
+semantics exist.
 
 ### DigitalAsset
 
@@ -160,6 +168,32 @@ documentation recommends explicit configuration.
 9. A retry at any point observes natural keys and resumes without duplicate
    ownership, downloads, or license keys.
 
+The notification outbox is durable, but rendering and transport are delegated
+to the host Medusa Notification Module. Provider failure is retried separately
+and never rolls back an entitlement.
+
+Guest recovery uses an internal entitlement `guest_access_epoch` generation
+fence. Legacy and newly issued entitlements begin at generation `0`; a reissue
+increments it in the same transaction that rotates guest access. Notification
+attempts bind their pending session and checkpoint to the expected generation,
+then recheck it under the entitlement/session/delivery locks before activation.
+A stale attempt's capability is revoked immediately. Cancellation follows
+confirmed provider-data redaction; redaction failures remain in a cleanup-only
+retry state and eventually dead-letter with the capability still revoked.
+Provider-facing template data stays epoch-free because this value is
+orchestration state, not customer content. Because provider transport is an
+external side effect, a call already in flight when reissue wins can deliver an
+unusable stale link, but the generation fence prevents its activation.
+If revocation, refund, or expiry wins only after the provider accepted a
+redacted send, recovery records that delivery as sent while revoking the pending
+capability; it never activates the now-unusable entitlement or resends the
+message.
+
+Rotation invalidation is independent of replacement issuance: when an operator
+reissues a guest entitlement while guest access is disabled, the epoch still
+advances and existing sessions are revoked, but no replacement token is minted.
+Re-enabling guest access therefore cannot revive a pre-reissue capability.
+
 The plugin deliberately does not add a custom cart-completion route. MakePay or
 another provider remains responsible for payment status. Store policy controls
 whether `order.placed` authorization is enough or a later captured/paid signal
@@ -169,6 +203,8 @@ is required.
 
 1. An authenticated customer lists only entitlements linked to their actor ID.
    A guest presents a high-entropy capability delivered out of band.
+   Its purchase-recovery TTL defaults to 30 days and is independently
+   configurable from short-lived asset grants.
 2. Requesting a download validates entitlement state, expiry, release access,
    asset membership, delivery mode, logical count, and optional IP policy.
 3. The server creates a short-lived grant and returns the same-origin protected
@@ -216,6 +252,25 @@ a second hash.
     entitlement to attacker-selected content.
 12. Refund/cancellation behavior is explicit, configurable, audited, and
     idempotent; it is never silently ignored.
+13. Issuance and revocation serialize on the same order lock; an order-wide
+    revoke/refund and all corresponding notification outbox rows commit or roll
+    back as one module transaction.
+14. License writes lock the entitlement before its assignment, then re-read
+    ownership, assignment state, and key relationships before revealing or
+    mutating device state. Guest reveal first discovers the capability's
+    entitlement and rejects a crossed assignment/token pair before acquiring
+    either graph; the matching graph is then locked and fully revalidated.
+    Reissue rotates active as well as stale assignments, refreshes assignment
+    expiry, and deactivates prior devices before assigning the replacement key.
+15. Expiration notification keys identify a persisted expiration cycle: retries
+    reuse it, while reissue followed by another expiry creates a new cycle.
+16. Hourly lifecycle maintenance uses bounded, stable-cutoff scans, then
+    rechecks status and expiry under the entitlement lock before changing state.
+    Missing terminal outboxes are repaired in the same transaction as cycle
+    metadata; invalid legacy recipients are classified as non-deliverable.
+17. Guest capability activation is fenced by the entitlement's internal access
+    generation; stale notification attempts cannot reactivate a token issued
+    before reissue and must revoke, cancel, and redact it instead.
 
 ## API boundaries
 

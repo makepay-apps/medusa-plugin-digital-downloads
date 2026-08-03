@@ -475,7 +475,7 @@ describe("digital product release workflows", () => {
       input: {
         id: "drel_publish",
         make_active: true,
-        notify_existing_customers: true,
+        notify_existing_customers: false,
       },
       context: { transactionId: "test:publish-release:advance-current" },
     })
@@ -484,7 +484,7 @@ describe("digital product release workflows", () => {
       id: "drel_publish",
       status: "published",
       is_current: true,
-      notify_existing_customers: true,
+      notify_existing_customers: false,
       metadata: {
         asset_set_locked: true,
         published_asset_ids: ["dasset_release"],
