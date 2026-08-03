@@ -1,0 +1,91 @@
+import type { NotificationTypes } from "@medusajs/framework/types"
+import {
+  AbstractNotificationProviderService,
+  MedusaError,
+} from "@medusajs/framework/utils"
+import nodemailer, { type Transporter } from "nodemailer"
+
+import {
+  renderDigitalDownloadEmail,
+  type DigitalDownloadEmailOptions,
+  validateDigitalDownloadEmailOptions,
+} from "./templates"
+
+type Options = DigitalDownloadEmailOptions & {
+  channels?: string[]
+  smtpUrl: string
+  from: string
+  replyTo?: string
+}
+
+export default class DigitalDownloadEmailProviderService extends AbstractNotificationProviderService {
+  static identifier = "digital-download-email"
+
+  protected readonly options_: Options
+  protected readonly transporter_: Transporter
+
+  static validateOptions(options: Record<string, unknown>): void {
+    for (const field of ["smtpUrl", "from", "storefrontBaseUrl"] as const) {
+      if (typeof options[field] !== "string" || !options[field].trim()) {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `Digital download email provider option ${field} is required`
+        )
+      }
+    }
+    try {
+      validateDigitalDownloadEmailOptions(
+        options as DigitalDownloadEmailOptions
+      )
+    } catch {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Digital download email storefront URLs must be valid, HTTPS, credential-free, and same-origin; orderDetailsPathTemplate must contain exactly one {order_id} placeholder"
+      )
+    }
+  }
+
+  constructor(_container: unknown, options: Options) {
+    super()
+    DigitalDownloadEmailProviderService.validateOptions(options)
+    this.options_ = options
+    this.transporter_ = nodemailer.createTransport(options.smtpUrl)
+  }
+
+  async send(
+    notification: NotificationTypes.ProviderSendNotificationDTO
+  ): Promise<NotificationTypes.ProviderSendNotificationResultsDTO> {
+    if (notification.channel !== "email") {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Digital download email provider only supports the email channel"
+      )
+    }
+
+    const content = renderDigitalDownloadEmail(
+      notification.template,
+      notification.data ?? {},
+      this.options_
+    )
+
+    try {
+      const result = await this.transporter_.sendMail({
+        from: notification.from?.trim() || this.options_.from,
+        to: notification.to,
+        replyTo: this.options_.replyTo,
+        subject: content.subject,
+        text: content.text,
+        html: content.html,
+      })
+      return { id: result.messageId }
+    } catch {
+      // Transport errors can contain credentials, recipients, or rendered
+      // capability URLs. Return a stable safe error and inspect sanitized SMTP
+      // provider telemetry outside the application process.
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Digital download email transport failed"
+      )
+    }
+  }
+}

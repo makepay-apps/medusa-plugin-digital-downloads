@@ -39,6 +39,9 @@ const digitalDownloads = createDigitalDownloadsClient({
   transport: createMedusaSdkTransport(sdk.client, {
     headers: async () => getAuthHeaders(),
   }),
+  grantHeaders: {
+    "x-publishable-api-key": process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY!,
+  },
 })
 ```
 
@@ -77,11 +80,21 @@ the link.
 
 Grant tokens are short-lived Authorization bearers. The client normalizes the
 wire grant into a fetch-ready object and `fetchDigitalAccessGrant` supports
-range requests without leaking the bearer in a URL:
+range requests without leaking the bearer in a URL. The native-fetch client
+also carries its configured Medusa publishable key into the protected-byte
+request. Custom transports can supply the same requirement with
+`grantHeaders`:
 
 ```ts
 const response = await fetchDigitalAccessGrant(grant, {
   range: "bytes=0-1048575",
+})
+
+const sdkDigitalDownloads = createDigitalDownloadsClient({
+  transport: createMedusaSdkTransport(sdk.client),
+  grantHeaders: {
+    "x-publishable-api-key": process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY!,
+  },
 })
 
 // Pipe response.body, save it, or proxy it through your storefront backend.

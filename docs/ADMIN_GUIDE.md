@@ -100,16 +100,26 @@ mutable configuration fields.
 1. Enter a unique version, optional name, and release notes.
 2. Create the draft release.
 3. Select the draft in **Upload assets**.
-4. Choose each file's delivery role, upload at least one file, and resolve all
-   failed uploads.
+4. For download, stream, or mixed delivery, choose each file's delivery role,
+   upload the required protected files, and resolve all failed uploads. A
+   license-only release may keep an empty asset set when the product has an
+   enabled generated or pooled license policy.
 5. Review filename, role, MIME type, size, storage provider, status, and checksum
    prefix.
 6. Publish the release.
 
-The publish control remains disabled while a release has no assets. New
-entitlements use the newly active published release. Existing entitlement
-snapshots must continue to reference the release/asset versions purchased at
-their own fulfillment time.
+Every digital product requires a current published release before fulfillment,
+including license-only products. Publication validates ready deliverables by
+delivery type: downloads need a download/manual asset, streams need a stream
+asset, mixed products need content and an enabled generated or pooled license
+policy, and license-only products need that policy but may publish with zero
+assets.
+
+New entitlements use the newly active published release. Existing entitlement
+snapshots continue to reference the release, assets, and license terms
+purchased at their own fulfillment time. The publish API's
+`notify_existing_customers: true` mode is explicitly unsupported until the
+product has defined entitlement update-policy semantics; leave it `false`.
 
 Only draft-release assets expose a delete action in the UI. A published asset
 is historical delivery state and should be replaced by a new release rather
@@ -162,6 +172,11 @@ Revocation preserves the historical entitlement record. It should invalidate
 new access grants and active sessions according to backend policy. Reissue is a
 separate audited operation; do not use it to conceal an incorrect refund or
 chargeback state.
+
+Reissuing a past-due entitlement also renews its original recorded access term,
+and the refreshed expiry is shown after the action completes. API-based support
+tools can instead supply a future `expires_at` or explicitly choose `null` for
+perpetual access. Refunded entitlements always require a new order.
 
 ## Medusa order widget
 
@@ -238,8 +253,14 @@ values change. See
 - signed grant lifetime and hard maximum grant lifetime;
 - maximum upload size;
 - default logical download limit;
-- guest-access and order-email-match policy;
+- guest-access enablement, guest capability lifetime, and order-email-match
+  policy;
 - audit retention target.
+
+`guest_access_ttl_seconds` controls the longer-lived purchase-recovery
+capability and defaults to 2,592,000 seconds (30 days). It is independent from
+the short-lived content grant lifetime shown above. Changing it affects newly
+issued guest capabilities, not existing entitlement or capability snapshots.
 
 Order-email matching defaults to enabled. While enabled, guest access, guest
 grant, and guest license-reveal requests must include the email from the order;
@@ -325,6 +346,8 @@ surface ship.
 
 - Confirm the product variants are linked to a digital configuration.
 - Confirm the configuration has a published release.
+- For license-only delivery, confirm that the published release is linked to an
+  enabled generated or pooled license policy; an asset upload is not required.
 - Confirm fulfillment has produced an entitlement for the order.
 - Use the overview or API with the same product/order filter to distinguish an
   empty result from a widget request failure.

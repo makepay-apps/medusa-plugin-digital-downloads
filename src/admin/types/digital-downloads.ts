@@ -145,6 +145,7 @@ export interface ProductConfig {
   product_id: string
   product_title?: string | null
   title: string
+  handle?: string | null
   description?: string | null
   status: DigitalProductStatus
   delivery_type: DeliveryType
@@ -209,6 +210,7 @@ export interface DigitalDownloadSettings {
   default_delivery_type: "download" | "stream" | "license" | "mixed"
   default_grant_ttl_seconds: number
   max_grant_ttl_seconds: number
+  guest_access_ttl_seconds: number
   max_upload_size_bytes: number
   allow_guest_access: boolean
   require_order_email_match: boolean
@@ -242,6 +244,7 @@ export type DigitalDownloadSettingsPatch = Partial<
     | "default_download_limit"
     | "default_grant_ttl_seconds"
     | "max_grant_ttl_seconds"
+    | "guest_access_ttl_seconds"
     | "max_upload_size_bytes"
     | "allow_guest_access"
     | "require_order_email_match"
@@ -291,6 +294,7 @@ export interface EntitlementFilters {
 export interface ProductConfigInput {
   product_id: string
   title: string
+  handle?: string
   description?: string | null
   status: DigitalProductStatus
   delivery_type: DeliveryType
@@ -307,6 +311,10 @@ export interface ReleaseInput {
   version: string
   title: string
   notes?: string | null
+}
+
+export interface ReleasePatchInput {
+  status?: "draft" | "ready"
 }
 
 export interface UploadIntent {

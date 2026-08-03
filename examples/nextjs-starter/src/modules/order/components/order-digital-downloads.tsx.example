@@ -1,0 +1,30 @@
+"use client"
+
+import {
+  DigitalOrderDownloads as PluginOrderDownloads,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+import { openProtectedContent } from "../../account/components/digital-library"
+
+type OrderDigitalDownloadsProps = {
+  order: {
+    id: string
+    display_id?: string | number | null
+  }
+  /** Use the same non-secret customer/session key passed to the provider. */
+  identityKey: string
+}
+
+/** Mount this beside the native line items on the customer order-detail page. */
+export function OrderDigitalDownloads({
+  order,
+  identityKey,
+}: OrderDigitalDownloadsProps) {
+  return (
+    <PluginOrderDownloads
+      identityKey={identityKey}
+      onGrant={openProtectedContent}
+      orderDisplayId={order.display_id}
+      orderId={order.id}
+    />
+  )
+}

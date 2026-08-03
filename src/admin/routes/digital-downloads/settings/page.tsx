@@ -32,6 +32,7 @@ interface SettingsFormState {
   defaultDeliveryType: DigitalDownloadSettings["default_delivery_type"]
   defaultGrantTtlSeconds: string
   maxGrantTtlSeconds: string
+  guestAccessTtlSeconds: string
   defaultDownloadLimit: string
   maxUploadSizeMb: string
   allowGuestAccess: boolean
@@ -44,6 +45,7 @@ const toFormState = (settings: DigitalDownloadSettings): SettingsFormState => ({
   defaultDeliveryType: settings.default_delivery_type,
   defaultGrantTtlSeconds: String(settings.default_grant_ttl_seconds),
   maxGrantTtlSeconds: String(settings.max_grant_ttl_seconds),
+  guestAccessTtlSeconds: String(settings.guest_access_ttl_seconds),
   defaultDownloadLimit:
     settings.default_download_limit === null ||
     settings.default_download_limit === undefined
@@ -149,6 +151,7 @@ const DigitalDownloadsSettingsPage = () => {
     event.preventDefault()
     const defaultGrantTtlSeconds = Number(form.defaultGrantTtlSeconds)
     const maxGrantTtlSeconds = Number(form.maxGrantTtlSeconds)
+    const guestAccessTtlSeconds = Number(form.guestAccessTtlSeconds)
     const maxUploadSizeMb = Number(form.maxUploadSizeMb)
     const eventRetentionDays = Number(form.eventRetentionDays)
     const defaultDownloadLimit = optionalNumber(form.defaultDownloadLimit)
@@ -168,6 +171,16 @@ const DigitalDownloadsSettingsPage = () => {
     ) {
       toast.error(
         "Maximum signed link lifetime must be at least the default and no more than 86,400 seconds."
+      )
+      return
+    }
+    if (
+      !Number.isInteger(guestAccessTtlSeconds) ||
+      guestAccessTtlSeconds < 86_400 ||
+      guestAccessTtlSeconds > 31_536_000
+    ) {
+      toast.error(
+        "Guest access lifetime must be between 86,400 and 31,536,000 seconds."
       )
       return
     }
@@ -194,6 +207,7 @@ const DigitalDownloadsSettingsPage = () => {
       default_delivery_type: form.defaultDeliveryType,
       default_grant_ttl_seconds: defaultGrantTtlSeconds,
       max_grant_ttl_seconds: maxGrantTtlSeconds,
+      guest_access_ttl_seconds: guestAccessTtlSeconds,
       default_download_limit: defaultDownloadLimit,
       max_upload_size_bytes: Math.round(maxUploadSizeMb * 1024 * 1024),
       allow_guest_access: form.allowGuestAccess,
@@ -325,6 +339,30 @@ const DigitalDownloadsSettingsPage = () => {
                 required
                 type="number"
                 value={form.maxGrantTtlSeconds}
+              />
+              <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-ui-fg-muted txt-small">
+                seconds
+              </span>
+            </div>
+          </Field>
+
+          <Field
+            htmlFor="guest-access-ttl"
+            hint="Lifetime of the guest purchase link sent after fulfillment; separate from signed asset links"
+            label="Guest access lifetime"
+            required
+          >
+            <div className="relative">
+              <Input
+                id="guest-access-ttl"
+                max={31_536_000}
+                min={86_400}
+                onChange={(event) =>
+                  update("guestAccessTtlSeconds", event.target.value)
+                }
+                required
+                type="number"
+                value={form.guestAccessTtlSeconds}
               />
               <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-ui-fg-muted txt-small">
                 seconds

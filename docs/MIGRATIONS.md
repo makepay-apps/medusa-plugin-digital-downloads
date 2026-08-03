@@ -34,6 +34,75 @@ Its `down` path restores the early development punctuation and is intended only
 for disposable preview databases used with the matching older package; current
 v1 workers must not run against the downgraded constraint.
 
+`Migration20260803090000.ts` is the non-destructive version 0.4 settings
+migration. It adds the required `guest_access_ttl_seconds` column with a
+2,592,000-second (30-day) default and a database constraint permitting values
+from 86,400 through 31,536,000 seconds (1 through 365 days). Existing settings
+rows receive the default. The setting controls newly issued guest
+purchase-recovery capabilities; it is independent of short-lived asset/content
+grants and does not rewrite already-issued access-session expirations. The same
+migration replaces the notification outbox's unique entitlement/template/
+recipient index with a non-unique lookup index so separately idempotent reissue
+and revocation lifecycle messages can coexist. The unique `idempotency_key`
+index remains authoritative. Its `down` path can recreate the older natural-key
+uniqueness only when no two live rows share the same `entitlement_id`,
+`template`, and `recipient_hash`, so use that inverse only on disposable preview
+data. Before changing any schema, the rollback checks that prerequisite and
+stops with this deterministic diagnostic when reconciliation is required:
+
+```text
+Migration20260803090000 rollback blocked: duplicate live notification_delivery rows share (entitlement_id, template, recipient_hash).
+```
+
+The cycle-aware expiration/reissue and atomic revocation behavior requires no
+additional columns or data rewrite. Existing `:expired:v1` and `:revoked:v1`
+outbox rows remain valid for their original cycle. Apply this migration before
+starting upgraded workers so later lifecycle cycles can create independent rows.
+
+Stop notification writers and run the following query. The rollback
+prerequisite is that it returns zero rows:
+
+```sql
+select
+  "entitlement_id",
+  "template",
+  "recipient_hash",
+  count(*) as "live_row_count"
+from "notification_delivery"
+where "deleted_at" is null
+group by "entitlement_id", "template", "recipient_hash"
+having count(*) > 1
+order by "entitlement_id", "template", "recipient_hash";
+```
+
+If the query returns rows, review each independently idempotent lifecycle
+delivery and choose the one row that can remain live under the old schema.
+Reconcile superseded rows with an audited soft-delete (`deleted_at`) operation
+so their notification history remains stored; do not hard-delete records. Retry
+the rollback only after the query returns no rows. Restoring the pre-migration
+backup is the preferred production rollback when that semantic reconciliation
+is not appropriate.
+
+`Migration20260803183000.ts` completes the version 0.4 guest-delivery upgrade
+path. It extends an existing installation's access-session status constraint
+with the fail-closed `pending` state used while an email provider is processing
+a guest capability. Fresh databases already receive the same status domain
+from the initial schema. Its rollback revokes any still-pending capability
+before restoring the older constraint.
+
+`Migration20260803200000.ts` adds the internal, non-negative
+`digital_entitlement.guest_access_epoch` generation fence. Existing entitlement
+rows are assigned the legacy generation `0`; new rows also default to `0`.
+Guest-token reissue advances the value atomically with entitlement rotation so
+an in-flight notification from an older generation cannot activate its stale
+capability. Such an attempt's access session is revoked immediately; the
+delivery is canceled after provider-data redaction succeeds. Redaction failures
+remain cleanup-only retries and can dead-letter without restoring capability
+access. The epoch is orchestration state only and is deliberately omitted from
+the notification-provider payload.
+The migration's `down` path removes the constraint and column, so it must not be
+used while version 0.4 workers still rely on generation fencing.
+
 The entitlement-to-release foreign key is required and uses `NO ACTION` on
 delete; an asset or unfinished upload may have no release yet. The generated
 `down` method drops all 16 tables and is therefore destructive. It exists for

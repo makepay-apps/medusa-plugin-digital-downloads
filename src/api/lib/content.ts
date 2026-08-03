@@ -261,7 +261,10 @@ function setContentHeaders(
 ) {
   res.set(CONTENT_SECURITY_HEADERS)
   if (isPublicPreview) {
-    res.setHeader("Cache-Control", "public, max-age=300, must-revalidate")
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=300, must-revalidate, no-transform",
+    )
   }
   res.setHeader("Accept-Ranges", "bytes")
   res.setHeader("Content-Type", content.mimeType)
@@ -288,6 +291,12 @@ function setContentHeaders(
   } else {
     res.status(200)
   }
+}
+
+function assertGetOnly(req: MedusaRequest, res: MedusaResponse): void {
+  if (req.method === "GET") return
+  res.setHeader("Allow", "GET")
+  throw apiError(405, "method_not_allowed", "Only GET is supported.")
 }
 
 async function completeTransfer(
@@ -354,6 +363,7 @@ export async function streamGrantedContent(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  assertGetOnly(req, res)
   const service = resolveDigitalDownloadsService(req)
   const assetId = parseId(req.params.asset_id)
   const token = getBearerGrantToken(req)
@@ -528,6 +538,7 @@ export async function streamPublicPreview(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  assertGetOnly(req, res)
   const service = resolveDigitalDownloadsService(req)
   const assetId = parseId(req.params.asset_id)
   const rangeHeader = validateSingleRangeSyntax(req.get("range"))

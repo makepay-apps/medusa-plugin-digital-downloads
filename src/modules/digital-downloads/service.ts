@@ -1,4 +1,5 @@
 import type { Context, FindConfig } from "@medusajs/framework/types"
+import { randomUUID } from "node:crypto"
 import type { Readable } from "node:stream"
 import {
   InjectManager,
@@ -52,26 +53,38 @@ import {
   LicenseAuditAction,
   LicensePoolKeyStatus,
   LicenseStrategy,
+  NotificationChannel,
   NotificationDeliveryState,
+  type ActivateGuestAccessSessionInput,
   type ActivateLicenseInput,
   type AssignLicenseKeyInput,
   type CreateDigitalProductConfigInput,
   type CreateDownloadGrantInput,
   type CreateGuestAccessSessionInput,
   type DigitalDownloadsModuleOptions,
+  type ExpireEntitlementIfDueInput,
+  type FinalizeNotificationGuestAccessInput,
+  type FinalizeNotificationGuestAccessResult,
   type ImportLicenseKeysInput,
   type IssueEntitlementRowInput,
   type IssueOrderEntitlementsInput,
+  type LifecycleNotificationRepairCandidate,
   type LicenseKeyClientInput,
+  type ListLifecycleNotificationRepairCandidatesInput,
   type OpenDigitalAssetInput,
   type OpenDigitalAssetResult,
+  type RepairLifecycleNotificationInput,
   type RedeemDownloadGrantContext,
+  type ReissueEntitlementInput,
   type ResolvedDigitalDownloadsModuleOptions,
+  type RevokeEntitlementWithNotificationInput,
+  type RevokeOrderEntitlementsInput,
   type UpdateDigitalProductConfigInput,
 } from "./types"
 import {
   assertMimeTypeAllowed,
   assertSafeAttribution,
+  DEFAULT_GUEST_ACCESS_TTL_SECONDS,
   decryptSecret,
   deriveOpaqueToken,
   digitalDownloadsStorageNamespaceFingerprint,
@@ -79,6 +92,8 @@ import {
   generateLicenseKey,
   keyedFingerprint,
   licenseKeyHint,
+  MAX_GUEST_ACCESS_TTL_SECONDS,
+  MIN_GUEST_ACCESS_TTL_SECONDS,
   normalizeAndFingerprint,
   normalizeLicenseKey,
   resolveDigitalDownloadsOptions,
@@ -107,8 +122,26 @@ const TERMINAL_ENTITLEMENT_STATUSES = new Set<DigitalEntitlementStatus>([
 const RANGE_CONTINUATION_WINDOW_MS = 15 * 60 * 1000
 const RANGE_CONTINUATION_MAX_REQUESTS = 64
 const RANGE_CONTINUATION_MAX_ASSET_MULTIPLIER = 2
+const MAX_GUEST_ACCESS_EPOCH = 2_147_483_647
+export const GUEST_ACCESS_EPOCH_SUPERSEDED = "guest_access_epoch_superseded"
 
 type CanonicalByteRange = { start: number; end: number; length: number }
+
+export class DownloadByteRangeError extends MedusaError {
+  readonly status = 416
+  readonly statusCode = 416
+  readonly details: { total_size: number }
+
+  constructor(
+    code: "invalid_range" | "range_not_satisfiable",
+    message: string,
+    totalSize: number,
+  ) {
+    super(MedusaError.Types.INVALID_DATA, message, code)
+    this.name = "DownloadByteRangeError"
+    this.details = { total_size: totalSize }
+  }
+}
 
 function invalid(message: string): never {
   throw new MedusaError(MedusaError.Types.INVALID_DATA, message)
@@ -120,6 +153,13 @@ function forbidden(message: string): never {
 
 function conflict(message: string): never {
   throw new MedusaError(MedusaError.Types.CONFLICT, message)
+}
+
+function invalidLicenseKey(): never {
+  throw new MedusaError(
+    MedusaError.Types.UNAUTHORIZED,
+    "License key is invalid",
+  )
 }
 
 async function collectBoundedStream(
@@ -178,6 +218,138 @@ function positiveInteger(
   return value as number
 }
 
+export function guestAccessEpoch(value: unknown): number {
+  const candidate = value === null || value === undefined ? 0 : value
+  if (
+    !Number.isSafeInteger(candidate) ||
+    (candidate as number) < 0 ||
+    (candidate as number) > MAX_GUEST_ACCESS_EPOCH
+  ) {
+    throw new MedusaError(
+      MedusaError.Types.UNEXPECTED_STATE,
+      "Guest access epoch is invalid",
+    )
+  }
+  return candidate as number
+}
+
+export class GuestAccessEpochSupersededError extends Error {
+  readonly code = GUEST_ACCESS_EPOCH_SUPERSEDED
+
+  constructor(
+    readonly expectedEpoch: number,
+    readonly currentEpoch: number,
+  ) {
+    super("Guest access generation was superseded")
+    this.name = "GuestAccessEpochSupersededError"
+  }
+}
+
+export function isGuestAccessEpochSupersededError(
+  error: unknown,
+): error is GuestAccessEpochSupersededError {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      (error as { code?: unknown }).code === GUEST_ACCESS_EPOCH_SUPERSEDED,
+  )
+}
+
+function guestAccessEpochFromMetadata(metadata: unknown): number {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return 0
+  }
+  return guestAccessEpoch(
+    (metadata as Record<string, unknown>).guest_access_epoch,
+  )
+}
+
+function guestAccessEpochOrNull(value: unknown): number | null {
+  try {
+    return guestAccessEpoch(value)
+  } catch {
+    return null
+  }
+}
+
+function guestAccessPolicyTtl(value: unknown, name: string): number {
+  const ttl = positiveInteger(Number(value), name, {
+    max: MAX_GUEST_ACCESS_TTL_SECONDS,
+  })
+  if (ttl < MIN_GUEST_ACCESS_TTL_SECONDS) {
+    invalid(`${name} must be at least ${MIN_GUEST_ACCESS_TTL_SECONDS}`)
+  }
+  return ttl
+}
+
+function effectiveGuestAccessTtl(
+  persisted: unknown,
+  configured: unknown,
+): number {
+  const configuredTtl = guestAccessPolicyTtl(
+    configured ?? DEFAULT_GUEST_ACCESS_TTL_SECONDS,
+    "guestAccessTtlSeconds",
+  )
+  const persistedTtl = guestAccessPolicyTtl(
+    persisted ?? configuredTtl,
+    "guest_access_ttl_seconds",
+  )
+  return Math.min(persistedTtl, configuredTtl)
+}
+
+function effectiveGrantTtlPolicy(
+  settings: AnyRecord,
+  configuredDefault: unknown,
+  configuredMax: unknown,
+): { defaultTtl: number; maxTtl: number } {
+  const runtimeMax = positiveInteger(
+    Number(configuredMax),
+    "maxGrantTtlSeconds",
+    { max: Number.MAX_SAFE_INTEGER },
+  )
+  const persistedMax = positiveInteger(
+    Number(settings.max_grant_ttl_seconds ?? runtimeMax),
+    "max_grant_ttl_seconds",
+    { max: Number.MAX_SAFE_INTEGER },
+  )
+  const maxTtl = Math.min(persistedMax, runtimeMax)
+  const runtimeDefault = positiveInteger(
+    Number(configuredDefault),
+    "defaultGrantTtlSeconds",
+    { max: runtimeMax },
+  )
+  const persistedDefault = positiveInteger(
+    Number(settings.default_grant_ttl_seconds ?? runtimeDefault),
+    "default_grant_ttl_seconds",
+    { max: Number.MAX_SAFE_INTEGER },
+  )
+  return {
+    defaultTtl: Math.min(persistedDefault, runtimeDefault, maxTtl),
+    maxTtl,
+  }
+}
+
+function effectiveUploadSizeLimit(
+  persisted: unknown,
+  configured: unknown,
+): number {
+  const runtimeLimit = positiveInteger(
+    Number(configured),
+    "maxUploadSizeBytes",
+    { max: Number.MAX_SAFE_INTEGER },
+  )
+  const persistedLimit = positiveInteger(
+    Number(persisted ?? runtimeLimit),
+    "max_upload_size_bytes",
+    { max: Number.MAX_SAFE_INTEGER },
+  )
+  return Math.min(persistedLimit, runtimeLimit)
+}
+
+function guestAccessAllowed(settings: AnyRecord, configured: unknown): boolean {
+  return settings.allow_guest_access === true && configured !== false
+}
+
 function bounded(value: string, name: string, max = 512): string {
   const normalized = value?.trim()
   if (!normalized || normalized.length > max || /[\r\n\0]/.test(normalized)) {
@@ -207,8 +379,15 @@ function canonicalByteRange(
 ): CanonicalByteRange | undefined {
   if (!request.range && !request.range_header) return undefined
   const totalSize = Number(rawTotalSize)
-  if (!Number.isSafeInteger(totalSize) || totalSize <= 0) {
+  if (!Number.isSafeInteger(totalSize) || totalSize < 0) {
     invalid("Digital asset size is invalid")
+  }
+  if (totalSize === 0) {
+    throw new DownloadByteRangeError(
+      "range_not_satisfiable",
+      "Byte range is not satisfiable",
+      totalSize,
+    )
   }
 
   let start: number
@@ -226,7 +405,11 @@ function canonicalByteRange(
     if (value.startsWith("-")) {
       const suffix = Number(value.slice(1))
       if (!Number.isSafeInteger(suffix) || suffix <= 0) {
-        invalid("Byte range is invalid")
+        throw new DownloadByteRangeError(
+          "invalid_range",
+          "Byte range is invalid",
+          totalSize,
+        )
       }
       start = Math.max(0, totalSize - suffix)
       end = totalSize - 1
@@ -241,7 +424,11 @@ function canonicalByteRange(
         end < start ||
         start >= totalSize
       ) {
-        invalid("Byte range is not satisfiable")
+        throw new DownloadByteRangeError(
+          "range_not_satisfiable",
+          "Byte range is not satisfiable",
+          totalSize,
+        )
       }
       end = Math.min(end, totalSize - 1)
     }
@@ -255,7 +442,11 @@ function canonicalByteRange(
       end < start ||
       start >= totalSize
     ) {
-      invalid("Byte range is not satisfiable")
+      throw new DownloadByteRangeError(
+        "range_not_satisfiable",
+        "Byte range is not satisfiable",
+        totalSize,
+      )
     }
     end = Math.min(end, totalSize - 1)
   }
@@ -288,6 +479,54 @@ function safeFilename(value: string): string {
     invalid("filename is invalid")
   }
   return filename
+}
+
+const STORAGE_OBJECT_LEAF_MAX_BYTES = 255
+const PRESERVED_UPLOAD_EXTENSION_MAX_BYTES = 32
+
+function truncateUtf8ToBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value
+  }
+  let bytes = 0
+  let codeUnits = 0
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8")
+    if (bytes + characterBytes > maxBytes) break
+    bytes += characterBytes
+    codeUnits += character.length
+  }
+  return value.slice(0, codeUnits)
+}
+
+function uploadStorageLeaf(objectId: string, filename: string): string {
+  const prefix = `${objectId}-`
+  const suffixBudget =
+    STORAGE_OBJECT_LEAF_MAX_BYTES - Buffer.byteLength(prefix, "utf8")
+  if (suffixBudget < 1) {
+    throw new MedusaError(
+      MedusaError.Types.UNEXPECTED_STATE,
+      "Generated upload object identifier exceeds the storage leaf limit",
+    )
+  }
+  const sanitized = filename.replace(/[^A-Za-z0-9._-]+/g, "-")
+  if (Buffer.byteLength(sanitized, "utf8") <= suffixBudget) {
+    return `${prefix}${sanitized}`
+  }
+
+  const dot = sanitized.lastIndexOf(".")
+  const candidateExtension =
+    dot > 0 && dot < sanitized.length - 1 ? sanitized.slice(dot) : ""
+  const extension =
+    /^\.[A-Za-z0-9]+$/.test(candidateExtension) &&
+    Buffer.byteLength(candidateExtension, "utf8") <=
+      PRESERVED_UPLOAD_EXTENSION_MAX_BYTES
+      ? candidateExtension
+      : ""
+  const stem = extension ? sanitized.slice(0, dot) : sanitized
+  const stemBudget = suffixBudget - Buffer.byteLength(extension, "utf8")
+  const boundedStem = truncateUtf8ToBytes(stem, stemBudget)
+  return `${prefix}${boundedStem}${extension}`
 }
 
 function assetKind(mimeType: string, filename: string): DigitalAssetKind {
@@ -340,6 +579,63 @@ function uploadAssetIntent(purpose: DigitalUploadPurpose): {
     case DigitalUploadPurpose.KEY_IMPORT:
       conflict("License key imports must use the dedicated key import endpoint")
   }
+}
+
+function deliveryTypeForAssetRole(role: DigitalAssetRole): DigitalDeliveryMode {
+  switch (role) {
+    case DigitalAssetRole.STREAM:
+      return DigitalDeliveryMode.STREAM
+    case DigitalAssetRole.LICENSE:
+      return DigitalDeliveryMode.LICENSE
+    case DigitalAssetRole.DOWNLOAD:
+    case DigitalAssetRole.PREVIEW:
+    case DigitalAssetRole.COVER:
+    case DigitalAssetRole.MANUAL:
+      return DigitalDeliveryMode.DOWNLOAD
+    default:
+      invalid("Digital asset role is invalid")
+  }
+}
+
+function assetRoleAllowsDeliveryType(
+  role: DigitalAssetRole,
+  deliveryType: DigitalDeliveryMode,
+): boolean {
+  if (
+    deliveryType === DigitalDeliveryMode.MIXED &&
+    [DigitalAssetRole.DOWNLOAD, DigitalAssetRole.STREAM].includes(role)
+  ) {
+    return true
+  }
+  return deliveryTypeForAssetRole(role) === deliveryType
+}
+
+function normalizeCreatedAssetDelivery(entry: AnyRecord): AnyRecord {
+  const normalized = { ...entry }
+  if (normalized.role === undefined && normalized.delivery_type === undefined) {
+    return normalized
+  }
+  if (normalized.role === undefined) {
+    normalized.role =
+      normalized.delivery_type === DigitalDeliveryMode.STREAM
+        ? DigitalAssetRole.STREAM
+        : normalized.delivery_type === DigitalDeliveryMode.LICENSE
+          ? DigitalAssetRole.LICENSE
+          : DigitalAssetRole.DOWNLOAD
+  }
+  if (!Object.values(DigitalAssetRole).includes(normalized.role)) {
+    invalid("Digital asset role is invalid")
+  }
+  if (normalized.delivery_type === undefined) {
+    normalized.delivery_type = deliveryTypeForAssetRole(normalized.role)
+  }
+  if (
+    !Object.values(DigitalDeliveryMode).includes(normalized.delivery_type) ||
+    !assetRoleAllowsDeliveryType(normalized.role, normalized.delivery_type)
+  ) {
+    invalid("Digital asset role and delivery type are incompatible")
+  }
+  return normalized
 }
 
 function isDuplicateError(error: unknown): boolean {
@@ -462,6 +758,74 @@ function entitlementIsUsable(entitlement: AnyRecord, now: Date): void {
   }
 }
 
+function validStoredDate(value: unknown): Date | null {
+  if (!(value instanceof Date) && typeof value !== "string") return null
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+function reissueExpiry(
+  entitlement: AnyRecord,
+  explicitExpiry: Date | string | null | undefined,
+  hasExplicitExpiry: boolean,
+  now: Date,
+): Date | null {
+  if (hasExplicitExpiry) {
+    if (explicitExpiry === null) return null
+    const parsed = parseDate(explicitExpiry, "expires_at")
+    if (!parsed || parsed <= now) {
+      invalid("expires_at must be later than the reissue time")
+    }
+    return parsed
+  }
+
+  const previousExpiry = validStoredDate(entitlement.expires_at)
+  if (!previousExpiry || previousExpiry > now) {
+    return previousExpiry
+  }
+
+  const lastReissuedAt = validStoredDate(
+    entitlement.metadata?.last_reissued_at,
+  )
+  const purchasedAt = validStoredDate(entitlement.snapshot?.purchased_at)
+  const createdAt = validStoredDate(entitlement.created_at)
+  const baseline = [lastReissuedAt, purchasedAt, createdAt].find(
+    (candidate) =>
+      candidate &&
+      candidate.getTime() > 0 &&
+      candidate.getTime() < previousExpiry.getTime(),
+  )
+  const duration = baseline
+    ? previousExpiry.getTime() - baseline.getTime()
+    : Number.NaN
+  const renewedTimestamp = now.getTime() + duration
+  if (
+    !Number.isFinite(duration) ||
+    duration <= 0 ||
+    !Number.isFinite(renewedTimestamp)
+  ) {
+    conflict(
+      "Expired entitlement has no recoverable purchase term; supply a future expires_at or null",
+    )
+  }
+  const renewed = new Date(renewedTimestamp)
+  if (Number.isNaN(renewed.getTime())) {
+    conflict(
+      "Expired entitlement has no recoverable purchase term; supply a future expires_at or null",
+    )
+  }
+  return renewed
+}
+
+function storedLifecycleId(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 255 &&
+    !/[\r\n\0]/.test(value)
+    ? value
+    : undefined
+}
+
 function assertReleaseDeliverables(
   release: AnyRecord,
   product: AnyRecord,
@@ -490,13 +854,12 @@ function assertReleaseDeliverables(
         asset.delivery_type,
       ),
   )
-  const hasLicense =
-    roles.has(DigitalAssetRole.LICENSE) ||
-    Boolean(
-      licensePolicy?.is_enabled !== false &&
-        licensePolicy?.strategy &&
-        licensePolicy.strategy !== LicenseStrategy.NONE,
-    )
+  const hasLicense = Boolean(
+    licensePolicy?.is_enabled === true &&
+      [LicenseStrategy.GENERATED, LicenseStrategy.POOL].includes(
+        licensePolicy.strategy,
+      ),
+  )
   const valid =
     product.delivery_type === DigitalDeliveryMode.LICENSE
       ? hasLicense
@@ -607,6 +970,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       "entitlement_access_session",
       "license_assignment",
       "license_policy",
+      "notification_delivery",
     ])
     if (!allowedTables.has(table)) {
       throw new MedusaError(
@@ -620,6 +984,93 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       .orderBy("id")
       .forUpdate()
       .select("id")
+  }
+
+  /**
+   * License lifecycle writers serialize through the entitlement before the
+   * assignment. The preliminary assignment relationship is never trusted
+   * after either lock has waited.
+   */
+  private async lockLicenseAssignmentGraph_(
+    assignmentId: string,
+    observedEntitlementId: string | undefined,
+    sharedContext: AnyRecord,
+  ): Promise<{ assignment: AnyRecord; entitlement: AnyRecord }> {
+    const observed = observedEntitlementId
+      ? undefined
+      : await this.retrieveLicenseAssignment(
+          assignmentId,
+          {},
+          sharedContext,
+        )
+    const relationshipEntitlementId =
+      observedEntitlementId ?? observed?.entitlement_id
+    if (typeof relationshipEntitlementId !== "string") {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "License assignment has no entitlement relationship",
+      )
+    }
+    const entitlementId = bounded(
+      relationshipEntitlementId,
+      "entitlement_id",
+      255,
+    )
+    await this.lockRows_("digital_entitlement", [entitlementId], sharedContext)
+    await this.lockRows_("license_assignment", [assignmentId], sharedContext)
+    const assignment = await this.retrieveLicenseAssignment(
+      assignmentId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (assignment.entitlement_id !== entitlementId) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "License assignment relationships changed unexpectedly",
+      )
+    }
+    const entitlement = await this.retrieveDigitalEntitlement(
+      entitlementId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    return { assignment, entitlement }
+  }
+
+  private async lockAndRevalidateResolvedLicenseKey_(
+    resolved: {
+      poolKey: AnyRecord
+      assignment: AnyRecord
+    },
+    sharedContext: AnyRecord,
+  ): Promise<{
+    poolKey: AnyRecord
+    assignment: AnyRecord
+    entitlement: AnyRecord
+  }> {
+    const graph = await this.lockLicenseAssignmentGraph_(
+      resolved.assignment.id,
+      resolved.assignment.entitlement_id,
+      sharedContext,
+    )
+    if (
+      !graph.assignment.license_pool_key_id ||
+      graph.assignment.license_pool_key_id !== resolved.poolKey.id
+    ) {
+      invalidLicenseKey()
+    }
+    const poolKey = await this.retrieveLicensePoolKey(
+      resolved.poolKey.id,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (
+      poolKey.status !== LicensePoolKeyStatus.ASSIGNED ||
+      poolKey.license_policy_id !== graph.assignment.license_policy_id
+    ) {
+      invalidLicenseKey()
+    }
+    return { ...graph, poolKey }
   }
 
   /** Compatibility vocabulary used by admin/API adapters. */
@@ -783,7 +1234,9 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         sharedContext,
       )
     }
-    const entries = Array.isArray(data) ? data : [data]
+    const entries = (Array.isArray(data) ? data : [data]).map(
+      normalizeCreatedAssetDelivery,
+    )
     const releaseIds = entries
       .map((entry) => entry.release_id)
       .filter((id): id is string => typeof id === "string" && Boolean(id))
@@ -793,8 +1246,20 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       if (await this.releaseIsImmutable_(entry.release_id, sharedContext)) {
         conflict("Published or entitlement-referenced releases are immutable")
       }
+      if (entry.mime_type !== undefined) {
+        if (typeof entry.mime_type !== "string") {
+          invalid("Digital asset MIME type is invalid")
+        }
+        assertMimeTypeAllowed(
+          entry.mime_type,
+          this.options_.allowedMimeTypes ?? [],
+        )
+      }
     }
-    return this.callGenerated_("createDigitalAssets", [data, sharedContext])
+    return this.callGenerated_("createDigitalAssets", [
+      Array.isArray(data) ? entries : entries[0],
+      sharedContext,
+    ])
   }
 
   updateDigitalAssets = async (
@@ -807,7 +1272,14 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         sharedContext,
       )
     }
-    const updates = Array.isArray(data) ? data : [data]
+    const updates = (Array.isArray(data) ? data : [data]).map((update) =>
+      update.role === undefined
+        ? { ...update }
+        : {
+            ...update,
+            delivery_type: deliveryTypeForAssetRole(update.role),
+          },
+    )
     const assetIds = updates.map((update) => {
       if (!update.id) conflict("Digital asset updates require explicit ids")
       return bounded(update.id, "asset id", 255)
@@ -836,6 +1308,16 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       ) {
         conflict("Digital asset changed concurrently; retry the update")
       }
+      const effectiveRole = update.role ?? existing.role
+      const effectiveDeliveryType =
+        update.delivery_type ?? existing.delivery_type
+      if (
+        !Object.values(DigitalAssetRole).includes(effectiveRole) ||
+        !Object.values(DigitalDeliveryMode).includes(effectiveDeliveryType) ||
+        !assetRoleAllowsDeliveryType(effectiveRole, effectiveDeliveryType)
+      ) {
+        invalid("Digital asset role and delivery type are incompatible")
+      }
       const changed = Object.entries(update).some(
         ([key, value]) =>
           key !== "id" && canonicalJson(existing[key]) !== canonicalJson(value),
@@ -853,8 +1335,19 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       ) {
         conflict("Assets cannot be attached to an immutable release")
       }
+      const effectiveMimeType = update.mime_type ?? existing.mime_type
+      if (typeof effectiveMimeType !== "string") {
+        invalid("Digital asset MIME type is invalid")
+      }
+      assertMimeTypeAllowed(
+        effectiveMimeType,
+        this.options_.allowedMimeTypes ?? [],
+      )
     }
-    return this.callGenerated_("updateDigitalAssets", [data, sharedContext])
+    return this.callGenerated_("updateDigitalAssets", [
+      Array.isArray(data) ? updates : updates[0],
+      sharedContext,
+    ])
   }
 
   deleteDigitalAssets = async (
@@ -1170,6 +1663,13 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     @MedusaContext() sharedContext: Context = {},
   ): Promise<AnyRecord> {
     const releaseId = bounded(id, "release id", 255)
+    const notifyExistingCustomers =
+      input.notify_existing_customers ?? input.notifyExistingCustomers ?? false
+    if (notifyExistingCustomers) {
+      invalid(
+        "notify_existing_customers is not supported; publish the release with false",
+      )
+    }
     const settings = await this.getSettings(sharedContext)
     if (!settings.enabled) {
       forbidden("Digital downloads are not enabled")
@@ -1242,8 +1742,6 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     )
 
     const makeActive = input.make_active ?? input.makeActive ?? true
-    const notifyExistingCustomers =
-      input.notify_existing_customers ?? input.notifyExistingCustomers ?? false
     return this.inTransaction_(async (transactionContext) => {
       const knex = this.transactionKnex_(transactionContext)
       const releaseRow = await knex("digital_product_release")
@@ -1367,7 +1865,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
               transactionContext,
             )
           : product,
-        notify_existing_customers: notifyExistingCustomers,
+        notify_existing_customers: false,
       }
     }, sharedContext)
   }
@@ -1465,60 +1963,70 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         allowZero: true,
       })
       return {
-        digital_product_id: bounded(
-          row.digital_product_id,
-          "digital_product_id",
-          255,
-        ),
-        release_id: row.digital_product_release_id
-          ? bounded(
-              row.digital_product_release_id,
-              "digital_product_release_id",
-              255,
-            )
-          : null,
-        status: row.status ?? DigitalEntitlementStatus.ACTIVE,
-        source: DigitalEntitlementSource.ORDER,
-        order_id: bounded(row.order_id, "order_id", 255),
-        order_line_item_id: bounded(row.line_item_id, "line_item_id", 255),
-        fulfillment_id: row.fulfillment_id
-          ? bounded(row.fulfillment_id, "fulfillment_id", 255)
-          : null,
-        customer_id: row.customer_id
-          ? bounded(row.customer_id, "customer_id", 255)
-          : null,
-        customer_email: normalizeEmail(row.email),
-        customer_name: row.customer_name?.trim().slice(0, 512) || null,
-        unit_index: unitIndex,
-        quantity: positiveInteger(row.quantity ?? 1, "quantity"),
-        available_at: availableAt,
-        expires_at: expiresAt,
-        download_limit:
-          row.download_limit === undefined
-            ? settings.default_download_limit
-            : row.download_limit === null
+        createGuestAccess: row.create_guest_access !== false,
+        row: {
+          digital_product_id: bounded(
+            row.digital_product_id,
+            "digital_product_id",
+            255,
+          ),
+          release_id: row.digital_product_release_id
+            ? bounded(
+                row.digital_product_release_id,
+                "digital_product_release_id",
+                255,
+              )
+            : null,
+          status: row.status ?? DigitalEntitlementStatus.ACTIVE,
+          source: DigitalEntitlementSource.ORDER,
+          order_id: bounded(row.order_id, "order_id", 255),
+          order_line_item_id: bounded(row.line_item_id, "line_item_id", 255),
+          fulfillment_id: row.fulfillment_id
+            ? bounded(row.fulfillment_id, "fulfillment_id", 255)
+            : null,
+          customer_id: row.customer_id
+            ? bounded(row.customer_id, "customer_id", 255)
+            : null,
+          customer_email: normalizeEmail(row.email),
+          customer_name: row.customer_name?.trim().slice(0, 512) || null,
+          unit_index: unitIndex,
+          quantity: positiveInteger(row.quantity ?? 1, "quantity"),
+          available_at: availableAt,
+          expires_at: expiresAt,
+          download_limit:
+            row.download_limit === undefined
+              ? settings.default_download_limit
+              : row.download_limit === null
+                ? null
+                : positiveInteger(row.download_limit, "download_limit", {
+                    allowZero: true,
+                  }),
+          license_activation_limit:
+            row.license_activation_limit === undefined ||
+            row.license_activation_limit === null
               ? null
-              : positiveInteger(row.download_limit, "download_limit", {
-                  allowZero: true,
-                }),
-        license_activation_limit:
-          row.license_activation_limit === undefined ||
-          row.license_activation_limit === null
-            ? null
-            : positiveInteger(
-                row.license_activation_limit,
-                "license_activation_limit",
-                { allowZero: true },
-              ),
-        idempotency_key: idempotencyKey,
-        snapshot: row.snapshot ?? {},
-        metadata: row.metadata ?? {},
+              : positiveInteger(
+                  row.license_activation_limit,
+                  "license_activation_limit",
+                  { allowZero: true },
+                ),
+          idempotency_key: idempotencyKey,
+          snapshot: row.snapshot ?? {},
+          metadata: row.metadata ?? {},
+        },
       }
     })
 
     const result: AnyRecord[] = []
-    const withGuestCapability = async (entitlement: AnyRecord) => {
-      if (entitlement.customer_id || !settings.allow_guest_access) {
+    const withGuestCapability = async (
+      entitlement: AnyRecord,
+      createGuestAccess: boolean,
+    ) => {
+      if (
+        !createGuestAccess ||
+        entitlement.customer_id ||
+        !guestAccessAllowed(settings, this.options_?.allowGuestAccess)
+      ) {
         return entitlement
       }
       const guest = await this.createGuestAccessSession(
@@ -1537,7 +2045,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         guest_access: { session: guest.session, token: guest.token },
       }
     }
-    for (const row of prepared) {
+    for (const { row, createGuestAccess } of prepared) {
       const product = await this.retrieveDigitalProduct(
         row.digital_product_id,
         {},
@@ -1571,6 +2079,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         conflict("Entitlements can only pin a published release of the product")
       }
       row.release_id = release.id
+      const snapshotOrder = (row.snapshot as AnyRecord)?.order
       row.snapshot = {
         ...(row.snapshot ?? {}),
         product: {
@@ -1585,6 +2094,11 @@ export default class DigitalDownloadsModuleService extends MedusaService({
           published_at: release.published_at,
         },
         order: {
+          ...(snapshotOrder &&
+          typeof snapshotOrder === "object" &&
+          !Array.isArray(snapshotOrder)
+            ? snapshotOrder
+            : {}),
           id: row.order_id,
           line_item_id: row.order_line_item_id,
           unit_index: row.unit_index,
@@ -1604,7 +2118,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         if (!entitlementMatches(existing[0], row)) {
           conflict("Idempotency key is already associated with another entitlement")
         }
-        result.push(await withGuestCapability(existing[0]))
+        result.push(await withGuestCapability(existing[0], createGuestAccess))
         continue
       }
 
@@ -1613,7 +2127,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
           row as any,
           sharedContext,
         )
-        result.push(await withGuestCapability(created))
+        result.push(await withGuestCapability(created, createGuestAccess))
       } catch (error) {
         if (!isDuplicateError(error)) {
           throw error
@@ -1629,7 +2143,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         if (!entitlementMatches(raced[0], row)) {
           conflict("Idempotency key is already associated with another entitlement")
         }
-        result.push(await withGuestCapability(raced[0]))
+        result.push(await withGuestCapability(raced[0], createGuestAccess))
       }
     }
     return result
@@ -1663,13 +2177,48 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     if (TERMINAL_ENTITLEMENT_STATUSES.has(entitlement.status)) {
       conflict(`Cannot revoke an entitlement in ${entitlement.status} state`)
     }
+    const observedAssignments = await this.listLicenseAssignments(
+      {
+        entitlement_id: entitlement.id,
+        status: LicenseAssignmentStatus.ACTIVE,
+      },
+      {},
+      sharedContext,
+    )
+    await this.lockRows_(
+      "license_assignment",
+      observedAssignments.map((assignment) => assignment.id),
+      sharedContext,
+    )
+    const assignments = (
+      await Promise.all(
+        observedAssignments.map((assignment) =>
+          this.retrieveLicenseAssignment(
+            assignment.id,
+            { options: { refresh: true } } as any,
+            sharedContext,
+          ),
+        ),
+      )
+    ).filter(
+      (assignment) =>
+        assignment.entitlement_id === entitlement.id &&
+        assignment.status === LicenseAssignmentStatus.ACTIVE,
+    )
     const now = new Date()
+    const revocationId = randomUUID()
     const updated = await this.updateDigitalEntitlements(
       {
         id: entitlement.id,
         status: DigitalEntitlementStatus.REVOKED,
         revoked_at: now,
         revoke_reason: revokeReason,
+        metadata: {
+          ...(entitlement.metadata ?? {}),
+          last_revoked_at: now.toISOString(),
+          last_revocation_id: revocationId,
+          last_revocation_reason: revokeReason,
+        },
       },
       sharedContext,
     )
@@ -1712,14 +2261,6 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         sharedContext,
       )
     }
-    const assignments = await this.listLicenseAssignments(
-      {
-        entitlement_id: entitlement.id,
-        status: LicenseAssignmentStatus.ACTIVE,
-      },
-      {},
-      sharedContext,
-    )
     for (const assignment of assignments) {
       const activations = await this.listLicenseActivations(
         {
@@ -1744,6 +2285,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         {
           id: assignment.id,
           status: LicenseAssignmentStatus.REVOKED,
+          activation_count: 0,
           revoked_at: now,
           revoke_reason: revokeReason,
         },
@@ -1765,20 +2307,343 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     return updated
   }
 
+  /**
+   * Returns a bounded terminal-entitlement repair batch. A live delivery is
+   * relevant only when it belongs to the row's current lifecycle cycle. For
+   * legacy rows without a recorded cycle, any live delivery of the matching
+   * template is authoritative and prevents duplicate email.
+   */
+  @InjectManager()
+  async listLifecycleNotificationRepairCandidates(
+    input: ListLifecycleNotificationRepairCandidatesInput = {},
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<LifecycleNotificationRepairCandidate[]> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.listLifecycleNotificationRepairCandidates(
+            input,
+            transactionContext,
+          ),
+        sharedContext,
+      )
+    }
+
+    const limit = positiveInteger(input.limit ?? 250, "repair limit", {
+      max: 1_000,
+    })
+    const asOf = parseDate(input.as_of ?? new Date(), "repair as_of")
+    if (!asOf) {
+      invalid("repair as_of is required")
+    }
+    const knex = this.transactionKnex_(sharedContext)
+    const rawLifecycleIdSql = `case
+      when "entitlement"."status" = 'expired'
+        then "entitlement"."metadata" ->> 'last_expiration_id'
+      else "entitlement"."metadata" ->> 'last_revocation_id'
+    end`
+    // PostgreSQL text cannot contain NUL; length and CR/LF checks mirror the
+    // remaining storedLifecycleId validation used by the atomic writers.
+    const lifecycleIdSql = `case
+      when char_length((${rawLifecycleIdSql})) between 1 and 255
+        and (${rawLifecycleIdSql}) !~ E'[\\r\\n]'
+      then (${rawLifecycleIdSql})
+      else null
+    end`
+    const expectedKeySql = `case
+      when "entitlement"."status" = 'expired'
+        then concat(
+          "entitlement"."id",
+          ':expired:',
+          (${lifecycleIdSql})
+        )
+      else concat(
+          "entitlement"."id",
+          ':revoked:',
+          (${lifecycleIdSql})
+      )
+    end`
+    const expectedTemplateSql = `case
+      when "entitlement"."status" = 'expired'
+        then 'digital-downloads-expired'
+      else 'digital-downloads-revoked'
+    end`
+    const liveRelevantDelivery = knex("notification_delivery as delivery")
+      .select(knex.raw("1"))
+      .whereNull("delivery.deleted_at")
+      .whereRaw(
+        `((${lifecycleIdSql}) is not null and "delivery"."idempotency_key" = (${expectedKeySql}))
+          or ((${lifecycleIdSql}) is null
+            and "delivery"."entitlement_id" = "entitlement"."id"
+            and "delivery"."template" = (${expectedTemplateSql}))`,
+      )
+
+    const rows = await knex("digital_entitlement as entitlement")
+      .select([
+        "entitlement.id",
+        "entitlement.status",
+        "entitlement.revoke_reason",
+        "entitlement.metadata",
+      ])
+      .whereIn("entitlement.status", [
+        DigitalEntitlementStatus.EXPIRED,
+        DigitalEntitlementStatus.REVOKED,
+        DigitalEntitlementStatus.REFUNDED,
+      ])
+      .whereRaw(
+        `char_length(btrim("entitlement"."customer_email")) between 1 and 320`,
+      )
+      .whereRaw(
+        `btrim("entitlement"."customer_email") ~ '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'`,
+      )
+      .whereRaw(
+        `"entitlement"."customer_email" = lower(btrim("entitlement"."customer_email"))`,
+      )
+      .whereNull("entitlement.deleted_at")
+      .where("entitlement.updated_at", "<=", asOf)
+      .whereNotExists(liveRelevantDelivery)
+      .orderBy("entitlement.updated_at", "asc")
+      .orderBy("entitlement.id", "asc")
+      .limit(limit)
+
+    return rows.map((row: AnyRecord) => {
+      const storedReason =
+        row.status === DigitalEntitlementStatus.EXPIRED
+          ? row.metadata?.last_expiration_reason
+          : row.revoke_reason ?? row.metadata?.last_revocation_reason
+      const reason =
+        typeof storedReason === "string" &&
+        storedReason.trim() &&
+        storedReason.trim().length <= 2_000 &&
+        !/[\r\n\0]/.test(storedReason)
+          ? storedReason.trim()
+          : row.status === DigitalEntitlementStatus.EXPIRED
+            ? "Entitlement access period expired"
+            : "Lifecycle notification reconciliation"
+      return { id: row.id, status: row.status, reason }
+    })
+  }
+
+  /**
+   * Expires an entitlement and persists its customer notification in the same
+   * transaction. If the outbox write fails, the row remains eligible for the
+   * next expiry-job run while `expires_at` continues to deny content access.
+   */
+  @InjectManager()
+  async expireEntitlement(
+    id: string,
+    reason = "Entitlement access period expired",
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<{ entitlement: AnyRecord; delivery?: AnyRecord }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.expireEntitlement(id, reason, transactionContext),
+        sharedContext,
+      )
+    }
+    const entitlementId = bounded(id, "entitlement id", 255)
+    const expiryReason = bounded(reason, "expiry reason", 2000)
+    await this.lockRows_("digital_entitlement", [entitlementId], sharedContext)
+    const current = await this.retrieveDigitalEntitlement(
+      entitlementId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    const now = new Date()
+    let entitlement: AnyRecord = current
+    let transitioned = false
+    let expirationId = storedLifecycleId(
+      current.metadata?.last_expiration_id,
+    )
+    if (current.status !== DigitalEntitlementStatus.EXPIRED) {
+      if (current.status !== DigitalEntitlementStatus.ACTIVE) {
+        conflict(`Cannot expire an entitlement in ${current.status} state`)
+      }
+      const revoked = await this.revokeEntitlement(
+        current.id,
+        expiryReason,
+        { type: "scheduled_job", id: "expire-entitlements" },
+        sharedContext,
+      )
+      transitioned = true
+      expirationId = randomUUID()
+      entitlement = await this.updateDigitalEntitlements(
+        {
+          id: revoked.id,
+          status: DigitalEntitlementStatus.EXPIRED,
+          metadata: {
+            ...(revoked.metadata ?? current.metadata ?? {}),
+            last_expired_at: now.toISOString(),
+            last_expiration_id: expirationId,
+            last_expiration_reason: expiryReason,
+          },
+        },
+        sharedContext,
+      )
+    }
+
+    let delivery: AnyRecord | undefined
+    const notificationEmail =
+      entitlement.customer_email ?? current.customer_email
+    if (notificationEmail) {
+      const legacyIdempotencyKey = `${entitlement.id}:expired:v1`
+      if (!transitioned) {
+        if (expirationId) {
+          const cycleDelivery = await this.listNotificationDeliveries(
+            { idempotency_key: `${entitlement.id}:expired:${expirationId}` },
+            { take: 1 } as any,
+            sharedContext,
+          )
+          delivery = cycleDelivery[0]
+        }
+        if (!delivery && !expirationId) {
+          const legacyDelivery = await this.listNotificationDeliveries(
+            { idempotency_key: legacyIdempotencyKey },
+            { take: 1 } as any,
+            sharedContext,
+          )
+          delivery = legacyDelivery[0]
+          if (!delivery) {
+            const legacyLifecycleDelivery =
+              await this.listNotificationDeliveries(
+                {
+                  entitlement_id: entitlement.id,
+                  template: "digital-downloads-expired",
+                },
+                { take: 1, order: { created_at: "DESC" } } as any,
+                sharedContext,
+              )
+            delivery = legacyLifecycleDelivery[0]
+          }
+        }
+      }
+
+      if (!delivery) {
+        if (!expirationId) {
+          expirationId = randomUUID()
+          entitlement = await this.updateDigitalEntitlements(
+            {
+              id: entitlement.id,
+              metadata: {
+                ...(entitlement.metadata ?? current.metadata ?? {}),
+                last_expired_at:
+                  entitlement.metadata?.last_expired_at ?? now.toISOString(),
+                last_expiration_id: expirationId,
+                last_expiration_reason:
+                  entitlement.metadata?.last_expiration_reason ?? expiryReason,
+              },
+            },
+            sharedContext,
+          )
+        }
+        const idempotencyKey = `${entitlement.id}:expired:${expirationId}`
+        const existing = await this.listNotificationDeliveries(
+          { idempotency_key: idempotencyKey },
+          { take: 1 } as any,
+          sharedContext,
+        )
+        if (existing.length) {
+          delivery = existing[0]
+        } else {
+          try {
+            delivery = await this.createNotificationDeliveries(
+              {
+                entitlement_id: entitlement.id,
+                idempotency_key: idempotencyKey,
+                channel: NotificationChannel.EMAIL,
+                template: "digital-downloads-expired",
+                recipient_hash: await this.recipientHash(notificationEmail),
+                state: NotificationDeliveryState.PENDING,
+                attempt_count: 0,
+                max_attempts: 8,
+                payload: {
+                  entitlement_id: entitlement.id,
+                  order_id: entitlement.order_id ?? current.order_id,
+                  notification_type: "expired",
+                },
+                metadata: {},
+              },
+              sharedContext,
+            )
+          } catch (error) {
+            if (!isDuplicateError(error)) throw error
+            const raced = await this.listNotificationDeliveries(
+              { idempotency_key: idempotencyKey },
+              { take: 1 } as any,
+              sharedContext,
+            )
+            if (!raced.length) throw error
+            delivery = raced[0]
+          }
+        }
+      }
+    }
+    return {
+      entitlement,
+      ...(delivery ? { delivery } : {}),
+    }
+  }
+
+  /** Expires only if the entitlement is still active and due under the scan cutoff. */
+  @InjectManager()
+  async expireEntitlementIfDue(
+    input: ExpireEntitlementIfDueInput,
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<{
+    entitlement: AnyRecord
+    delivery?: AnyRecord
+    expired: boolean
+  }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.expireEntitlementIfDue(input, transactionContext),
+        sharedContext,
+      )
+    }
+
+    const entitlementId = bounded(
+      input.entitlement_id,
+      "entitlement id",
+      255,
+    )
+    const asOf = parseDate(input.as_of, "as_of")
+    if (!asOf) {
+      invalid("as_of is required")
+    }
+    await this.lockRows_("digital_entitlement", [entitlementId], sharedContext)
+    const current = await this.retrieveDigitalEntitlement(
+      entitlementId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    const expiresAt = validStoredDate(current.expires_at)
+    if (
+      current.status !== DigitalEntitlementStatus.ACTIVE ||
+      !expiresAt ||
+      expiresAt > asOf
+    ) {
+      return { entitlement: current, expired: false }
+    }
+
+    const result = await this.expireEntitlement(
+      current.id,
+      input.reason ?? "Entitlement access period expired",
+      sharedContext,
+    )
+    return { ...result, expired: true }
+  }
+
   @InjectManager()
   async reissueEntitlement(
-    input: {
-      entitlementId?: string
-      entitlement_id?: string
-      reason?: string
-      reset_downloads?: boolean
-      rotate_guest_token?: boolean
-      notify?: boolean
-    },
+    input: ReissueEntitlementInput,
     @MedusaContext() sharedContext: Context = {},
   ): Promise<{
     entitlement: AnyRecord
     guest_access?: { session: Record<string, unknown>; token: string }
+    guest_access_required?: boolean
+    delivery?: AnyRecord
   }> {
     if (!(sharedContext as AnyRecord).transactionManager) {
       return this.inTransaction_(
@@ -1798,18 +2663,72 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     if (previous.status === DigitalEntitlementStatus.REFUNDED) {
       conflict("Refunded entitlements require a new order")
     }
+    const settings = await this.getSettings(sharedContext)
+    const rotateGuestAccess = Boolean(
+      !previous.customer_id && input.rotate_guest_token !== false,
+    )
+    const guestAccessRequired = Boolean(
+      rotateGuestAccess &&
+      guestAccessAllowed(settings, this.options_?.allowGuestAccess),
+    )
+    if (
+      guestAccessRequired &&
+      ((input.create_guest_access === false && input.notify !== true) ||
+        (input.notify === true && !previous.customer_email))
+    ) {
+      invalid(
+        "Guest token rotation requires notification delivery to a customer email",
+      )
+    }
     const reason = input.reason?.trim().slice(0, 2000) || "manual reissue"
+    const now = new Date()
+    const previousGuestAccessEpoch = guestAccessEpoch(
+      previous.guest_access_epoch,
+    )
+    if (
+      rotateGuestAccess &&
+      previousGuestAccessEpoch >= MAX_GUEST_ACCESS_EPOCH
+    ) {
+      conflict("Guest access epoch cannot be advanced further")
+    }
+    const nextGuestAccessEpoch = rotateGuestAccess
+      ? previousGuestAccessEpoch + 1
+      : previousGuestAccessEpoch
+    const hasSnakeCaseExpiry = Object.prototype.hasOwnProperty.call(
+      input,
+      "expires_at",
+    )
+    const requestedExpiry = hasSnakeCaseExpiry
+      ? input.expires_at
+      : input.expiresAt
+    const hasExplicitExpiry =
+      (hasSnakeCaseExpiry && input.expires_at !== undefined) ||
+      (Object.prototype.hasOwnProperty.call(input, "expiresAt") &&
+        input.expiresAt !== undefined)
+    const renewedExpiry = reissueExpiry(
+      previous,
+      requestedExpiry,
+      hasExplicitExpiry,
+      now,
+    )
+    const reissueId = randomUUID()
     const entitlement = await this.updateDigitalEntitlements(
       {
         id: previous.id,
         status: DigitalEntitlementStatus.ACTIVE,
+        expires_at: renewedExpiry,
+        guest_access_epoch: nextGuestAccessEpoch,
         revoked_at: null,
         revoke_reason: null,
         ...(input.reset_downloads ? { download_count: 0 } : {}),
         metadata: {
           ...(previous.metadata ?? {}),
-          last_reissued_at: new Date().toISOString(),
+          last_reissued_at: now.toISOString(),
+          last_reissue_id: reissueId,
           last_reissue_reason: reason,
+          last_reissue_previous_expires_at:
+            validStoredDate(previous.expires_at)?.toISOString() ?? null,
+          last_reissue_expires_at: renewedExpiry?.toISOString() ?? null,
         },
       },
       sharedContext,
@@ -1817,13 +2736,8 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     let guestAccess:
       | { session: Record<string, unknown>; token: string }
       | undefined
-    const settings = await this.getSettings(sharedContext)
-    if (
-      !previous.customer_id &&
-      input.rotate_guest_token !== false &&
-      settings.allow_guest_access
-    ) {
-      const sessions = (
+    if (rotateGuestAccess) {
+      let sessions = (
         await this.listEntitlementAccessSessions(
           { entitlement_id: previous.id },
           {},
@@ -1835,25 +2749,135 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         ),
       )
       if (sessions.length) {
+        await this.lockRows_(
+          "entitlement_access_session",
+          sessions.map((session) => session.id),
+          sharedContext,
+        )
+        sessions = (
+          await this.listEntitlementAccessSessions(
+            { id: sessions.map((session) => session.id) },
+            {},
+            sharedContext,
+          )
+        ).filter((session) =>
+          [AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
+            session.status,
+          ),
+        )
+      }
+      if (sessions.length) {
         await this.updateEntitlementAccessSessions(
           sessions.map((session) => ({
             id: session.id,
             status: AccessSessionStatus.REVOKED,
-            revoked_at: new Date(),
+            revoked_at: now,
             revoke_reason: "rotated_on_reissue",
           })),
           sharedContext,
         )
       }
-      const issued = await this.createGuestAccessSession(
-        {
-          entitlement_id: previous.id,
-          idempotency_key: `reissue:${previous.id}:${randomOpaqueToken("ri", 24)}`,
-          metadata: { reason },
-        },
-        sharedContext,
-      )
-      guestAccess = { session: issued.session, token: issued.token }
+      if (
+        guestAccessRequired &&
+        input.create_guest_access !== false &&
+        input.notify !== true
+      ) {
+        const issued = await this.createGuestAccessSession(
+          {
+            entitlement_id: previous.id,
+            idempotency_key: `reissue:${previous.id}:${randomOpaqueToken("ri", 24)}`,
+            expected_guest_access_epoch: nextGuestAccessEpoch,
+            metadata: { reason, guest_access_epoch: nextGuestAccessEpoch },
+          },
+          sharedContext,
+        )
+        guestAccess = { session: issued.session, token: issued.token }
+      }
+
+      // A pure queued outbox has not crossed the provider boundary and can be
+      // canceled immediately. Checkpointed/PROCESSING rows remain retryable so
+      // the subscriber can revoke/redact them before terminal cancellation.
+      const olderDeliveries = (
+        await this.listNotificationDeliveries(
+          { entitlement_id: previous.id },
+          { take: 10_000 } as any,
+          sharedContext,
+        )
+      ).filter((candidate) => {
+        const payload = (candidate.payload ?? {}) as AnyRecord
+        const checkpoint = candidate.metadata?.notification_capability
+        if (
+          !payload.guest_access &&
+          !payload.guest_access_idempotency_key
+        ) {
+          return false
+        }
+        if (checkpoint) return false
+        if (
+          ![
+            NotificationDeliveryState.PENDING,
+            NotificationDeliveryState.FAILED,
+          ].includes(candidate.state)
+        ) {
+          return false
+        }
+        const candidateEpoch = guestAccessEpochOrNull(
+          payload.guest_access_epoch,
+        )
+        return candidateEpoch === null || candidateEpoch < nextGuestAccessEpoch
+      })
+      if (olderDeliveries.length) {
+        await this.lockRows_(
+          "notification_delivery",
+          olderDeliveries.map((candidate) => candidate.id),
+          sharedContext,
+        )
+        for (const candidate of olderDeliveries) {
+          const fresh = await this.retrieveNotificationDelivery(
+            candidate.id,
+            { options: { refresh: true } } as any,
+            sharedContext,
+          )
+          if (
+            ![
+              NotificationDeliveryState.PENDING,
+              NotificationDeliveryState.FAILED,
+            ].includes(fresh.state) ||
+            fresh.metadata?.notification_capability
+          ) {
+            continue
+          }
+          const payload = { ...(fresh.payload ?? {}) }
+          delete payload.guest_access
+          delete payload.guest_access_epoch
+          delete payload.guest_access_idempotency_key
+          delete payload.guest_access_token
+          await this.updateNotificationDeliveries(
+            {
+              id: fresh.id,
+              state: NotificationDeliveryState.CANCELED,
+              canceled_at: now,
+              lease_owner: null,
+              lease_expires_at: null,
+              next_retry_at: null,
+              error_code: GUEST_ACCESS_EPOCH_SUPERSEDED,
+              error_message: "Guest access generation was superseded",
+              payload,
+              metadata: {
+                ...(fresh.metadata ?? {}),
+                guest_access_superseded: {
+                  expected_epoch: guestAccessEpochOrNull(
+                    fresh.payload?.guest_access_epoch,
+                  ),
+                  current_epoch: nextGuestAccessEpoch,
+                  canceled_at: now.toISOString(),
+                },
+              },
+            },
+            sharedContext,
+          )
+        }
+      }
     }
     const policies = await this.listLicensePolicies(
       { digital_product_id: previous.digital_product_id, is_enabled: true },
@@ -1866,15 +2890,443 @@ export default class DigitalDownloadsModuleService extends MedusaService({
           entitlement_id: previous.id,
           license_policy_id: policies[0].id,
           idempotency_key: `reissue:${previous.id}:${randomOpaqueToken("lk", 24)}`,
+          replace_existing: true,
           metadata: { reason },
         },
         sharedContext,
       )
     }
+    let delivery: AnyRecord | undefined
+    const notificationEmail =
+      entitlement.customer_email ?? previous.customer_email
+    if (input.notify === true && notificationEmail) {
+      const idempotencyKey = `${entitlement.id}:reissued:${reissueId}`
+      const existing = await this.listNotificationDeliveries(
+        { idempotency_key: idempotencyKey },
+        { take: 1 } as any,
+        sharedContext,
+      )
+      if (existing.length) {
+        delivery = existing[0]
+      } else {
+        try {
+          delivery = await this.createNotificationDeliveries(
+            {
+              entitlement_id: entitlement.id,
+              idempotency_key: idempotencyKey,
+              channel: NotificationChannel.EMAIL,
+              template: "digital-downloads-reissued",
+              recipient_hash: await this.recipientHash(
+                notificationEmail,
+              ),
+              state: NotificationDeliveryState.PENDING,
+              attempt_count: 0,
+              max_attempts: 8,
+              payload: {
+                entitlement_id: entitlement.id,
+                order_id: entitlement.order_id ?? previous.order_id,
+                notification_type: "reissued",
+                reason,
+                ...(guestAccessRequired
+                  ? {
+                      guest_access: true,
+                      guest_access_epoch: nextGuestAccessEpoch,
+                    }
+                  : {}),
+              },
+              metadata: {},
+            },
+            sharedContext,
+          )
+        } catch (error) {
+          if (!isDuplicateError(error)) throw error
+          const raced = await this.listNotificationDeliveries(
+            { idempotency_key: idempotencyKey },
+            { take: 1 } as any,
+            sharedContext,
+          )
+          if (!raced.length) throw error
+          delivery = raced[0]
+        }
+      }
+    }
     return {
       entitlement,
+      guest_access_required: guestAccessRequired,
       ...(guestAccess ? { guest_access: guestAccess } : {}),
+      ...(delivery ? { delivery } : {}),
     }
+  }
+
+  @InjectTransactionManager()
+  private async ensureRevocationNotification_(
+    entitlement: AnyRecord,
+    cycleId: string,
+    reason: string,
+    allowLegacy: boolean,
+    @MedusaContext() sharedContext: Context,
+  ): Promise<AnyRecord | undefined> {
+    if (!entitlement.customer_email) return undefined
+
+    const idempotencyKey = `${entitlement.id}:revoked:${cycleId}`
+    const existing = await this.listNotificationDeliveries(
+      { idempotency_key: idempotencyKey },
+      { take: 1 } as any,
+      sharedContext,
+    )
+    if (existing.length) return existing[0]
+
+    if (allowLegacy) {
+      const legacy = await this.listNotificationDeliveries(
+        { idempotency_key: `${entitlement.id}:revoked:v1` },
+        { take: 1 } as any,
+        sharedContext,
+      )
+      if (legacy.length) return legacy[0]
+    }
+
+    try {
+      return await this.createNotificationDeliveries(
+        {
+          entitlement_id: entitlement.id,
+          idempotency_key: idempotencyKey,
+          channel: NotificationChannel.EMAIL,
+          template: "digital-downloads-revoked",
+          recipient_hash: await this.recipientHash(entitlement.customer_email),
+          state: NotificationDeliveryState.PENDING,
+          attempt_count: 0,
+          max_attempts: 8,
+          payload: {
+            entitlement_id: entitlement.id,
+            order_id: entitlement.order_id,
+            notification_type: "revoked",
+            reason,
+          },
+          metadata: {},
+        },
+        sharedContext,
+      )
+    } catch (error) {
+      if (!isDuplicateError(error)) throw error
+      const raced = await this.listNotificationDeliveries(
+        { idempotency_key: idempotencyKey },
+        { take: 1 } as any,
+        sharedContext,
+      )
+      if (!raced.length) throw error
+      return raced[0]
+    }
+  }
+
+  /** Atomically applies one revocation/refund state transition and its outbox. */
+  @InjectManager()
+  async revokeEntitlementWithNotification(
+    input: RevokeEntitlementWithNotificationInput,
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<{ entitlement: AnyRecord; delivery?: AnyRecord }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.revokeEntitlementWithNotification(input, transactionContext),
+        sharedContext,
+      )
+    }
+
+    const entitlementId = bounded(
+      input.entitlement_id,
+      "entitlement id",
+      255,
+    )
+    const reason = bounded(input.reason, "revoke reason", 2000)
+    const finalStatus =
+      input.final_status ?? DigitalEntitlementStatus.REVOKED
+    if (
+      ![
+        DigitalEntitlementStatus.REVOKED,
+        DigitalEntitlementStatus.REFUNDED,
+      ].includes(finalStatus)
+    ) {
+      invalid("final_status must be revoked or refunded")
+    }
+
+    await this.lockRows_("digital_entitlement", [entitlementId], sharedContext)
+    const current = await this.retrieveDigitalEntitlement(
+      entitlementId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    const now = new Date()
+    let entitlement: AnyRecord = current
+    let transitioned = false
+    let cycleId = storedLifecycleId(current.metadata?.last_revocation_id)
+    const hadStoredCycleId = Boolean(cycleId)
+
+    if (
+      current.status === DigitalEntitlementStatus.REFUNDED &&
+      finalStatus !== DigitalEntitlementStatus.REFUNDED
+    ) {
+      conflict("Cannot revoke an entitlement in refunded state")
+    }
+    if (
+      current.status === DigitalEntitlementStatus.EXPIRED &&
+      finalStatus !== DigitalEntitlementStatus.REFUNDED
+    ) {
+      conflict("Cannot revoke an entitlement in expired state")
+    }
+
+    if (
+      ![
+        DigitalEntitlementStatus.REVOKED,
+        DigitalEntitlementStatus.REFUNDED,
+        DigitalEntitlementStatus.EXPIRED,
+      ].includes(current.status)
+    ) {
+      entitlement = await this.revokeEntitlement(
+        current.id,
+        reason,
+        input.actor ?? {},
+        sharedContext,
+      )
+      transitioned = true
+      cycleId = storedLifecycleId(entitlement.metadata?.last_revocation_id)
+    }
+
+    if (
+      finalStatus === DigitalEntitlementStatus.REFUNDED &&
+      entitlement.status !== DigitalEntitlementStatus.REFUNDED
+    ) {
+      if (!transitioned) {
+        cycleId = randomUUID()
+      }
+      entitlement = await this.updateDigitalEntitlements(
+        {
+          id: entitlement.id,
+          status: DigitalEntitlementStatus.REFUNDED,
+          metadata: {
+            ...(entitlement.metadata ?? current.metadata ?? {}),
+            last_revoked_at: now.toISOString(),
+            last_revocation_id: cycleId,
+            last_revocation_reason: reason,
+            last_refunded_at: now.toISOString(),
+            last_refund_id: cycleId,
+            last_refund_reason: reason,
+          },
+        },
+        sharedContext,
+      )
+      transitioned = true
+    }
+
+    let delivery: AnyRecord | undefined
+    if (input.notify !== false && entitlement.customer_email) {
+      if (!cycleId && !transitioned) {
+        const legacy = await this.listNotificationDeliveries(
+          { idempotency_key: `${entitlement.id}:revoked:v1` },
+          { take: 1 } as any,
+          sharedContext,
+        )
+        if (legacy.length) {
+          delivery = legacy[0]
+        }
+        if (!delivery) {
+          const legacyLifecycleDelivery =
+            await this.listNotificationDeliveries(
+              {
+                entitlement_id: entitlement.id,
+                template: "digital-downloads-revoked",
+              },
+              { take: 1, order: { created_at: "DESC" } } as any,
+              sharedContext,
+            )
+          delivery = legacyLifecycleDelivery[0]
+        }
+      }
+      if (!delivery && !cycleId) {
+        cycleId = randomUUID()
+        const refunded =
+          entitlement.status === DigitalEntitlementStatus.REFUNDED
+        entitlement = await this.updateDigitalEntitlements(
+          {
+            id: entitlement.id,
+            metadata: {
+              ...(entitlement.metadata ?? current.metadata ?? {}),
+              last_revoked_at:
+                entitlement.metadata?.last_revoked_at ?? now.toISOString(),
+              last_revocation_id: cycleId,
+              last_revocation_reason:
+                entitlement.metadata?.last_revocation_reason ?? reason,
+              ...(refunded
+                ? {
+                    last_refunded_at:
+                      entitlement.metadata?.last_refunded_at ?? now.toISOString(),
+                    last_refund_id: cycleId,
+                    last_refund_reason:
+                      entitlement.metadata?.last_refund_reason ?? reason,
+                  }
+                : {}),
+            },
+          },
+          sharedContext,
+        )
+      }
+      if (!delivery && cycleId) {
+        delivery = await this.ensureRevocationNotification_(
+          entitlement,
+          cycleId,
+          reason,
+          !transitioned && !hadStoredCycleId,
+          sharedContext,
+        )
+      }
+    }
+
+    return {
+      entitlement,
+      ...(delivery ? { delivery } : {}),
+    }
+  }
+
+  /**
+   * Repairs one lifecycle outbox only while the row still has the status seen
+   * by the bounded maintenance scan. This closes the scan/repair race with a
+   * concurrent reissue or refund.
+   */
+  @InjectManager()
+  async repairLifecycleNotification(
+    input: RepairLifecycleNotificationInput,
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<{
+    entitlement: AnyRecord
+    delivery?: AnyRecord
+    repaired: boolean
+  }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.repairLifecycleNotification(input, transactionContext),
+        sharedContext,
+      )
+    }
+
+    const entitlementId = bounded(
+      input.entitlement_id,
+      "entitlement id",
+      255,
+    )
+    if (
+      ![
+        DigitalEntitlementStatus.EXPIRED,
+        DigitalEntitlementStatus.REVOKED,
+        DigitalEntitlementStatus.REFUNDED,
+      ].includes(input.expected_status)
+    ) {
+      invalid("expected_status must be expired, revoked, or refunded")
+    }
+    await this.lockRows_("digital_entitlement", [entitlementId], sharedContext)
+    const current = await this.retrieveDigitalEntitlement(
+      entitlementId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (current.status !== input.expected_status) {
+      return { entitlement: current, repaired: false }
+    }
+
+    const result =
+      input.expected_status === DigitalEntitlementStatus.EXPIRED
+        ? await this.expireEntitlement(
+            current.id,
+            input.reason,
+            sharedContext,
+          )
+        : await this.revokeEntitlementWithNotification(
+            {
+              entitlement_id: current.id,
+              reason: input.reason,
+              actor: {
+                type: "scheduled_job",
+                id: "lifecycle-notification-repair",
+              },
+              notify: true,
+              final_status: input.expected_status,
+            },
+            sharedContext,
+          )
+    return { ...result, repaired: true }
+  }
+
+  /**
+   * Serializes every selected entitlement in one transaction so an outbox
+   * failure cannot leave an order partially revoked or refunded.
+   */
+  @InjectManager()
+  async revokeOrderEntitlements(
+    input: RevokeOrderEntitlementsInput,
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<{ revoked: AnyRecord[]; deliveries: AnyRecord[] }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.revokeOrderEntitlements(input, transactionContext),
+        sharedContext,
+      )
+    }
+
+    const orderId = bounded(input.order_id, "order id", 255)
+    const lineItemIds = [
+      ...new Set(
+        (input.line_item_ids ?? []).map((id) =>
+          bounded(id, "line item id", 255),
+        ),
+      ),
+    ]
+    if (lineItemIds.length > 1_000) {
+      invalid("line_item_ids cannot contain more than 1000 values")
+    }
+
+    const knex = this.transactionKnex_(sharedContext)
+    const query = knex("digital_entitlement")
+      .select(["id", "status"])
+      .where({ order_id: orderId })
+      .whereNull("deleted_at")
+    if (lineItemIds.length) {
+      query.whereIn("order_line_item_id", lineItemIds)
+    }
+    const rows = await query.orderBy("id", "asc").limit(10_001).forUpdate()
+    if (rows.length > 10_000) {
+      conflict("Order contains more than 10000 digital entitlements")
+    }
+
+    const finalStatus =
+      input.trigger === "refund"
+        ? DigitalEntitlementStatus.REFUNDED
+        : DigitalEntitlementStatus.REVOKED
+    const revoked: AnyRecord[] = []
+    const deliveries: AnyRecord[] = []
+    for (const row of rows) {
+      if (
+        finalStatus === DigitalEntitlementStatus.REVOKED &&
+        [
+          DigitalEntitlementStatus.EXPIRED,
+          DigitalEntitlementStatus.REFUNDED,
+        ].includes(row.status)
+      ) {
+        continue
+      }
+      const result = await this.revokeEntitlementWithNotification(
+        {
+          entitlement_id: row.id,
+          reason: input.reason,
+          actor: input.actor,
+          notify: input.notify,
+          final_status: finalStatus,
+        },
+        sharedContext,
+      )
+      revoked.push(result.entitlement)
+      if (result.delivery) deliveries.push(result.delivery)
+    }
+    return { revoked, deliveries }
   }
 
   @InjectManager()
@@ -1984,10 +3436,15 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       forbidden(`Asset does not permit ${action} delivery`)
     }
 
+    const grantTtlPolicy = effectiveGrantTtlPolicy(
+      settings,
+      this.options_.defaultGrantTtlSeconds,
+      this.options_.maxGrantTtlSeconds,
+    )
     const ttl = positiveInteger(
-      input.ttl_seconds ?? Number(settings.default_grant_ttl_seconds),
+      input.ttl_seconds ?? grantTtlPolicy.defaultTtl,
       "ttl_seconds",
-      { max: Number(settings.max_grant_ttl_seconds) },
+      { max: grantTtlPolicy.maxTtl },
     )
     const maxUses = positiveInteger(input.max_uses ?? 1, "max_uses", {
       max: 10_000,
@@ -2085,7 +3542,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       )
     }
     const settings = await this.getSettings(sharedContext)
-    if (!settings.allow_guest_access) {
+    if (!guestAccessAllowed(settings, this.options_?.allowGuestAccess)) {
       forbidden("Guest entitlement access is disabled")
     }
     const idempotencyKey = bounded(
@@ -2109,7 +3566,28 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       { options: { refresh: true } } as any,
       sharedContext,
     )
+    const currentGuestAccessEpoch = guestAccessEpoch(
+      entitlement.guest_access_epoch,
+    )
+    const expectedGuestAccessEpoch =
+      input.expected_guest_access_epoch === undefined
+        ? currentGuestAccessEpoch
+        : guestAccessEpoch(input.expected_guest_access_epoch)
+    if (expectedGuestAccessEpoch !== currentGuestAccessEpoch) {
+      throw new GuestAccessEpochSupersededError(
+        expectedGuestAccessEpoch,
+        currentGuestAccessEpoch,
+      )
+    }
     entitlementIsUsable(entitlement, new Date())
+    const initialStatus = input.initial_status ?? AccessSessionStatus.ACTIVE
+    if (
+      ![AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
+        initialStatus,
+      )
+    ) {
+      invalid("Guest access initial status must be active or pending")
+    }
     const previous = await this.listEntitlementAccessSessions(
       { idempotency_key: idempotencyKey },
       {},
@@ -2119,24 +3597,35 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       if (previous[0].entitlement_id !== entitlement.id) {
         conflict("Idempotency key is already associated with another access session")
       }
+      if (
+        guestAccessEpochFromMetadata(previous[0].metadata) !==
+        expectedGuestAccessEpoch
+      ) {
+        throw new GuestAccessEpochSupersededError(
+          guestAccessEpochFromMetadata(previous[0].metadata),
+          currentGuestAccessEpoch,
+        )
+      }
+      if (
+        previous[0].status !== initialStatus ||
+        new Date(previous[0].expires_at) <= new Date()
+      ) {
+        conflict("Idempotent guest access session is no longer usable")
+      }
       return {
         session: this.safeAccessSession(previous[0]),
         token,
         created: false,
       }
     }
-    const initialStatus = input.initial_status ?? AccessSessionStatus.ACTIVE
-    if (
-      ![AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
-        initialStatus,
-      )
-    ) {
-      invalid("Guest access initial status must be active or pending")
-    }
+    const configuredGuestAccessTtl = effectiveGuestAccessTtl(
+      settings.guest_access_ttl_seconds,
+      this.options_.guestAccessTtlSeconds,
+    )
     const ttl = positiveInteger(
-      input.ttl_seconds ?? Math.min(Number(settings.max_grant_ttl_seconds), 86400),
+      input.ttl_seconds ?? configuredGuestAccessTtl,
       "ttl_seconds",
-      { max: Number(settings.max_grant_ttl_seconds) },
+      { max: configuredGuestAccessTtl },
     )
     let session: AnyRecord
     try {
@@ -2158,7 +3647,10 @@ export default class DigitalDownloadsModuleService extends MedusaService({
             this.options_.tokenSecret,
             "user-agent",
           ),
-          metadata: input.metadata ?? {},
+          metadata: {
+            ...(input.metadata ?? {}),
+            guest_access_epoch: currentGuestAccessEpoch,
+          },
         },
         sharedContext,
       )
@@ -2171,6 +3663,21 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       )
       if (!raced.length || raced[0].entitlement_id !== entitlement.id) {
         throw error
+      }
+      if (
+        guestAccessEpochFromMetadata(raced[0].metadata) !==
+        expectedGuestAccessEpoch
+      ) {
+        throw new GuestAccessEpochSupersededError(
+          guestAccessEpochFromMetadata(raced[0].metadata),
+          currentGuestAccessEpoch,
+        )
+      }
+      if (
+        raced[0].status !== initialStatus ||
+        new Date(raced[0].expires_at) <= new Date()
+      ) {
+        conflict("Idempotent guest access session is no longer usable")
       }
       return {
         session: this.safeAccessSession(raced[0]),
@@ -2202,19 +3709,30 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     }
     const id = bounded(sessionId, "guest access session id", 255)
     const revokeReason = bounded(reason, "guest access revoke reason", 2000)
-    await this.lockRows_("entitlement_access_session", [id], sharedContext)
-    const sessions = await this.listEntitlementAccessSessions(
+    const discovered = await this.listEntitlementAccessSessions(
       { id },
       {},
       sharedContext,
     )
-    if (!sessions.length) {
+    if (!discovered.length) {
       throw new MedusaError(
         MedusaError.Types.NOT_FOUND,
         "Guest access session was not found",
       )
     }
-    const session = sessions[0]
+    // All capability lifecycle mutations share entitlement -> session lock
+    // order so a reissue cannot be followed by a stale session mutation.
+    await this.lockRows_(
+      "digital_entitlement",
+      [discovered[0].entitlement_id],
+      sharedContext,
+    )
+    await this.lockRows_("entitlement_access_session", [id], sharedContext)
+    const session = await this.retrieveEntitlementAccessSession(
+      id,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
     if (
       ![AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
         session.status,
@@ -2238,22 +3756,62 @@ export default class DigitalDownloadsModuleService extends MedusaService({
   @InjectManager()
   async activateGuestAccessSession(
     sessionId: string,
+    input: ActivateGuestAccessSessionInput = {},
     @MedusaContext() sharedContext: Context = {},
   ): Promise<Record<string, unknown>> {
     if (!(sharedContext as AnyRecord).transactionManager) {
       return this.inTransaction_(
         (transactionContext) =>
-          this.activateGuestAccessSession(sessionId, transactionContext),
+          this.activateGuestAccessSession(sessionId, input, transactionContext),
         sharedContext,
       )
     }
     const id = bounded(sessionId, "guest access session id", 255)
+    const discovered = await this.retrieveEntitlementAccessSession(
+      id,
+      {},
+      sharedContext,
+    )
+    await this.lockRows_(
+      "digital_entitlement",
+      [discovered.entitlement_id],
+      sharedContext,
+    )
     await this.lockRows_("entitlement_access_session", [id], sharedContext)
     const session = await this.retrieveEntitlementAccessSession(
       id,
       { options: { refresh: true } } as any,
       sharedContext,
     )
+    const entitlement = await this.retrieveDigitalEntitlement(
+      session.entitlement_id,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    entitlementIsUsable(entitlement, new Date())
+    const currentEpoch = guestAccessEpoch(entitlement.guest_access_epoch)
+    const sessionEpoch = guestAccessEpochFromMetadata(session.metadata)
+    const expectedEpoch =
+      input.expected_guest_access_epoch === undefined
+        ? sessionEpoch
+        : guestAccessEpoch(input.expected_guest_access_epoch)
+    if (expectedEpoch !== currentEpoch || sessionEpoch !== expectedEpoch) {
+      throw new GuestAccessEpochSupersededError(expectedEpoch, currentEpoch)
+    }
+    if (
+      input.notification_delivery_id &&
+      session.metadata?.notification_delivery_id !==
+        bounded(
+          input.notification_delivery_id,
+          "notification delivery id",
+          255,
+        )
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Guest access session does not belong to the notification delivery",
+      )
+    }
     if (session.status === AccessSessionStatus.ACTIVE) {
       return this.safeAccessSession(session)
     }
@@ -2273,21 +3831,281 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     return this.safeAccessSession(activated)
   }
 
+  /**
+   * Commits the post-provider guest hand-off as one generation-fenced unit.
+   * The capability cannot become active unless its outbox row also becomes
+   * SENT under the same entitlement lock and transaction.
+   */
   @InjectManager()
-  async resolveGuestEntitlement(
-    rawToken: string,
-    request: { ip?: string; user_agent?: string; email?: string } = {},
+  async finalizeNotificationGuestAccess(
+    input: FinalizeNotificationGuestAccessInput,
     @MedusaContext() sharedContext: Context = {},
-  ): Promise<{ entitlement: AnyRecord; session: Record<string, unknown> }> {
-    const settings = await this.getSettings(sharedContext)
-    if (!settings.allow_guest_access) {
-      forbidden("Guest entitlement access is disabled")
+  ): Promise<FinalizeNotificationGuestAccessResult> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.finalizeNotificationGuestAccess(input, transactionContext),
+        sharedContext,
+      )
     }
+
+    const deliveryId = bounded(
+      input.delivery_id,
+      "notification delivery id",
+      255,
+    )
+    const entitlementId = bounded(input.entitlement_id, "entitlement id", 255)
+    const sessionId = bounded(input.session_id, "guest access session id", 255)
+    const workerId = bounded(input.worker_id, "worker id", 255)
+    const expectedEpoch = guestAccessEpoch(input.expected_guest_access_epoch)
+    const attempt = positiveInteger(input.attempt, "notification attempt", {
+      max: 1_000_000,
+    })
+
+    // Parent identifiers are immutable. Discover them without locks, then use
+    // the canonical entitlement -> session -> delivery lock order and refresh.
+    const discoveredDelivery = await this.retrieveNotificationDelivery(
+      deliveryId,
+      {},
+      sharedContext,
+    )
+    const discoveredSession = await this.retrieveEntitlementAccessSession(
+      sessionId,
+      {},
+      sharedContext,
+    )
+    if (
+      discoveredDelivery.entitlement_id !== entitlementId ||
+      discoveredSession.entitlement_id !== entitlementId
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Notification capability ownership is inconsistent",
+      )
+    }
+
+    await this.lockRows_("digital_entitlement", [entitlementId], sharedContext)
+    await this.lockRows_("entitlement_access_session", [sessionId], sharedContext)
+    await this.lockRows_("notification_delivery", [deliveryId], sharedContext)
+
+    const entitlement = await this.retrieveDigitalEntitlement(
+      entitlementId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    let session = await this.retrieveEntitlementAccessSession(
+      sessionId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    let delivery = await this.retrieveNotificationDelivery(
+      deliveryId,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (
+      delivery.entitlement_id !== entitlementId ||
+      session.entitlement_id !== entitlementId
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Notification capability ownership changed unexpectedly",
+      )
+    }
+    if (delivery.state === NotificationDeliveryState.SENT) {
+      return {
+        outcome: "sent",
+        delivery,
+        session: this.safeAccessSession(session),
+      }
+    }
+    if (delivery.state === NotificationDeliveryState.CANCELED) {
+      return {
+        outcome: "superseded",
+        delivery,
+        session: this.safeAccessSession(session),
+      }
+    }
+    if (
+      delivery.state !== NotificationDeliveryState.PROCESSING ||
+      delivery.lease_owner !== workerId
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.CONFLICT,
+        "Notification delivery lease is no longer owned by this worker",
+      )
+    }
+
+    const checkpoint = (
+      delivery.metadata?.notification_capability ?? {}
+    ) as AnyRecord
+    const sessionMetadata = (session.metadata ?? {}) as AnyRecord
+    const deliveryEpoch = guestAccessEpoch(
+      delivery.payload?.guest_access_epoch,
+    )
+    const checkpointEpoch = guestAccessEpoch(
+      checkpoint?.guest_access_epoch,
+    )
+    const sessionEpoch = guestAccessEpochFromMetadata(sessionMetadata)
+    const currentEpoch = guestAccessEpoch(entitlement.guest_access_epoch)
+
+    if (currentEpoch !== expectedEpoch) {
+      if (
+        [AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
+          session.status,
+        )
+      ) {
+        session = await this.updateEntitlementAccessSessions(
+          {
+            id: session.id,
+            status: AccessSessionStatus.REVOKED,
+            revoked_at: new Date(),
+            revoke_reason: "notification_guest_access_superseded",
+          },
+          sharedContext,
+        )
+      }
+      const payload = {
+        ...(delivery.payload ?? {}),
+      }
+      delete payload.guest_access
+      delete payload.guest_access_epoch
+      delete payload.guest_access_idempotency_key
+      delete payload.guest_access_token
+      delivery = await this.updateNotificationDeliveries(
+        {
+          id: delivery.id,
+          state: NotificationDeliveryState.CANCELED,
+          canceled_at: new Date(),
+          lease_owner: null,
+          lease_expires_at: null,
+          next_retry_at: null,
+          error_code: GUEST_ACCESS_EPOCH_SUPERSEDED,
+          error_message: "Guest access generation was superseded",
+          payload,
+          metadata: {
+            ...(delivery.metadata ?? {}),
+            guest_access_superseded: {
+              expected_epoch: expectedEpoch,
+              current_epoch: currentEpoch,
+              canceled_at: new Date().toISOString(),
+            },
+          },
+        },
+        sharedContext,
+      )
+      return {
+        outcome: "superseded",
+        delivery,
+        session: this.safeAccessSession(session),
+      }
+    }
+
+    if (
+      deliveryEpoch !== expectedEpoch ||
+      checkpointEpoch !== expectedEpoch ||
+      sessionEpoch !== expectedEpoch ||
+      checkpoint?.phase !== "sent_redacted" ||
+      checkpoint?.guest_session_id !== session.id ||
+      sessionMetadata.notification_delivery_id !== delivery.id
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Notification capability generation binding is inconsistent",
+      )
+    }
+
+    try {
+      entitlementIsUsable(entitlement, new Date())
+    } catch (error) {
+      if (!(error instanceof MedusaError)) throw error
+      if (
+        [AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
+          session.status,
+        )
+      ) {
+        session = await this.updateEntitlementAccessSessions(
+          {
+            id: session.id,
+            status: AccessSessionStatus.REVOKED,
+            revoked_at: new Date(),
+            revoke_reason: "notification_entitlement_unusable_after_send",
+          },
+          sharedContext,
+        )
+      }
+      delivery = await this.updateNotificationDeliveries(
+        {
+          id: delivery.id,
+          state: NotificationDeliveryState.SENT,
+          attempt_count: attempt,
+          sent_at: new Date(),
+          provider_message_id: input.provider_message_id ?? null,
+          lease_owner: null,
+          lease_expires_at: null,
+          next_retry_at: null,
+          error_code: null,
+          error_message: null,
+        },
+        sharedContext,
+      )
+      return {
+        outcome: "sent",
+        delivery,
+        session: this.safeAccessSession(session),
+      }
+    }
+    if (
+      ![AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
+        session.status,
+      ) ||
+      new Date(session.expires_at) <= new Date()
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.UNAUTHORIZED,
+        "Guest access session cannot be activated",
+      )
+    }
+    if (session.status === AccessSessionStatus.PENDING) {
+      session = await this.updateEntitlementAccessSessions(
+        { id: session.id, status: AccessSessionStatus.ACTIVE },
+        sharedContext,
+      )
+    }
+    delivery = await this.updateNotificationDeliveries(
+      {
+        id: delivery.id,
+        state: NotificationDeliveryState.SENT,
+        attempt_count: attempt,
+        sent_at: new Date(),
+        provider_message_id: input.provider_message_id ?? null,
+        lease_owner: null,
+        lease_expires_at: null,
+        next_retry_at: null,
+        error_code: null,
+        error_message: null,
+      },
+      sharedContext,
+    )
+    return {
+      outcome: "sent",
+      delivery,
+      session: this.safeAccessSession(session),
+    }
+  }
+
+  private async discoverGuestAccessSession_(
+    rawToken: string,
+    sharedContext: AnyRecord,
+  ): Promise<{ hash: string; session: AnyRecord }> {
     let hash: string
     try {
       hash = tokenHash(rawToken, this.options_.tokenSecret)
     } catch {
-      throw new MedusaError(MedusaError.Types.UNAUTHORIZED, "Guest access token is invalid")
+      throw new MedusaError(
+        MedusaError.Types.UNAUTHORIZED,
+        "Guest access token is invalid",
+      )
     }
     const sessions = await this.listEntitlementAccessSessions(
       { token_hash: hash },
@@ -2295,9 +4113,83 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       sharedContext,
     )
     if (!sessions.length) {
-      throw new MedusaError(MedusaError.Types.UNAUTHORIZED, "Guest access token is invalid")
+      throw new MedusaError(
+        MedusaError.Types.UNAUTHORIZED,
+        "Guest access token is invalid",
+      )
     }
-    const session = sessions[0]
+    return { hash, session: sessions[0] }
+  }
+
+  @InjectManager()
+  async resolveGuestEntitlement(
+    rawToken: string,
+    request: { ip?: string; user_agent?: string; email?: string } = {},
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<{ entitlement: AnyRecord; session: Record<string, unknown> }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.resolveGuestEntitlement(rawToken, request, transactionContext),
+        sharedContext,
+      )
+    }
+    const settings = await this.getSettings(sharedContext)
+    if (!guestAccessAllowed(settings, this.options_?.allowGuestAccess)) {
+      forbidden("Guest entitlement access is disabled")
+    }
+    const { hash, session: discovered } =
+      await this.discoverGuestAccessSession_(rawToken, sharedContext)
+    await this.lockRows_(
+      "digital_entitlement",
+      [discovered.entitlement_id],
+      sharedContext,
+    )
+    await this.lockRows_(
+      "entitlement_access_session",
+      [discovered.id],
+      sharedContext,
+    )
+    const session = await this.retrieveEntitlementAccessSession(
+      discovered.id,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (!safeHashEqual(session.token_hash, hash)) {
+      throw new MedusaError(
+        MedusaError.Types.UNAUTHORIZED,
+        "Guest access token is invalid",
+      )
+    }
+    const entitlement = await this.retrieveDigitalEntitlement(
+      session.entitlement_id,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (
+      guestAccessEpochFromMetadata(session.metadata) !==
+      guestAccessEpoch(entitlement.guest_access_epoch)
+    ) {
+      if (
+        [AccessSessionStatus.ACTIVE, AccessSessionStatus.PENDING].includes(
+          session.status,
+        )
+      ) {
+        await this.updateEntitlementAccessSessions(
+          {
+            id: session.id,
+            status: AccessSessionStatus.REVOKED,
+            revoked_at: new Date(),
+            revoke_reason: "guest_access_epoch_superseded",
+          },
+          sharedContext,
+        )
+      }
+      throw new MedusaError(
+        MedusaError.Types.UNAUTHORIZED,
+        "Guest access session is inactive",
+      )
+    }
     const now = new Date()
     if (session.status !== AccessSessionStatus.ACTIVE) {
       throw new MedusaError(MedusaError.Types.UNAUTHORIZED, "Guest access session is inactive")
@@ -2329,11 +4221,6 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         "Guest access request binding does not match",
       )
     }
-    const entitlement = await this.retrieveDigitalEntitlement(
-      session.entitlement_id,
-      {},
-      sharedContext,
-    )
     entitlementIsUsable(entitlement, now)
     if (settings.require_order_email_match) {
       let suppliedEmail: string | null = null
@@ -3182,7 +5069,16 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         {},
         sharedContext,
       )
-      if (product.status !== DigitalProductStatus.ACTIVE) {
+      const activeReleaseId = product.metadata?.active_release_id
+      const activeReleaseMismatch =
+        activeReleaseId !== undefined &&
+        (typeof activeReleaseId !== "string" || activeReleaseId !== release.id)
+      if (
+        product.id !== release.digital_product_id ||
+        product.status !== DigitalProductStatus.ACTIVE ||
+        product.metadata?.preview_enabled === false ||
+        activeReleaseMismatch
+      ) {
         throw new MedusaError(
           MedusaError.Types.NOT_FOUND,
           "Public preview is not available",
@@ -3332,8 +5228,12 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       forbidden("Digital downloads are not enabled")
     }
     const filename = safeFilename(input.filename)
+    const uploadSizeLimit = effectiveUploadSizeLimit(
+      settings.max_upload_size_bytes,
+      this.options_.maxUploadSizeBytes,
+    )
     const size = positiveInteger(input.size, "size", {
-      max: Number(settings.max_upload_size_bytes),
+      max: uploadSizeLimit,
     })
     assertMimeTypeAllowed(input.mime_type, this.options_.allowedMimeTypes)
     const checksum = input.checksum_sha256?.toLowerCase()
@@ -3357,8 +5257,8 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     ) {
       invalid("purpose must be download, stream, preview, cover, manual, or license")
     }
-    const suffix = filename.replace(/[^A-Za-z0-9._-]+/g, "-")
-    const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomOpaqueToken("up", 24)}-${suffix}`
+    const leaf = uploadStorageLeaf(randomOpaqueToken("up", 24), filename)
+    const key = `uploads/${new Date().toISOString().slice(0, 10)}/${leaf}`
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
     const uploadToken =
       provider === DigitalStorageProvider.LOCAL
@@ -3462,6 +5362,14 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     ) {
       invalid("Upload Content-Length or Content-Type does not match its intent")
     }
+    const settings = await this.getSettings(sharedContext)
+    const uploadSizeLimit = effectiveUploadSizeLimit(
+      settings.max_upload_size_bytes,
+      this.options_.maxUploadSizeBytes,
+    )
+    if (Number(upload.expected_size_bytes) > uploadSizeLimit) {
+      invalid("Upload exceeds the current configured upload size limit")
+    }
     const stored = await this.storage_.putStream({
       provider: DigitalStorageProvider.LOCAL,
       key: upload.storage_key,
@@ -3516,6 +5424,14 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       forbidden("Upload intent has expired")
     }
     const expectedSize = Number(upload.expected_size_bytes)
+    const settings = await this.getSettings(sharedContext)
+    const uploadSizeLimit = effectiveUploadSizeLimit(
+      settings.max_upload_size_bytes,
+      this.options_.maxUploadSizeBytes,
+    )
+    if (expectedSize > uploadSizeLimit) {
+      invalid("Upload exceeds the current configured upload size limit")
+    }
     let size = Number(upload.actual_size_bytes ?? 0)
     let checksum = upload.actual_checksum_sha256 as string | null
     if (upload.storage_provider === DigitalStorageProvider.S3) {
@@ -3885,20 +5801,48 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       "idempotency_key",
       512,
     )
+    const entitlementId = bounded(
+      input.entitlement_id,
+      "entitlement_id",
+      255,
+    )
+    const policyId = bounded(
+      input.license_policy_id,
+      "license_policy_id",
+      255,
+    )
     await this.lockRows_(
       "digital_entitlement",
-      [bounded(input.entitlement_id, "entitlement_id", 255)],
+      [entitlementId],
       sharedContext,
     )
-    const previous = await this.listLicenseAssignments(
+    let previous = await this.listLicenseAssignments(
       { idempotency_key: idempotencyKey },
       {},
       sharedContext,
     )
     if (previous.length) {
       if (
-        previous[0].entitlement_id !== input.entitlement_id ||
-        previous[0].license_policy_id !== input.license_policy_id
+        previous[0].entitlement_id !== entitlementId ||
+        previous[0].license_policy_id !== policyId
+      ) {
+        conflict("Idempotency key is already associated with another assignment")
+      }
+      await this.lockRows_(
+        "license_assignment",
+        [previous[0].id],
+        sharedContext,
+      )
+      previous = [
+        await this.retrieveLicenseAssignment(
+          previous[0].id,
+          { options: { refresh: true } } as any,
+          sharedContext,
+        ),
+      ]
+      if (
+        previous[0].entitlement_id !== entitlementId ||
+        previous[0].license_policy_id !== policyId
       ) {
         conflict("Idempotency key is already associated with another assignment")
       }
@@ -3925,13 +5869,13 @@ export default class DigitalDownloadsModuleService extends MedusaService({
 
     const now = new Date()
     const entitlement = await this.retrieveDigitalEntitlement(
-      bounded(input.entitlement_id, "entitlement_id", 255),
-      {},
+      entitlementId,
+      { options: { refresh: true } } as any,
       sharedContext,
     )
     entitlementIsUsable(entitlement, now)
     const policy = await this.retrieveLicensePolicy(
-      bounded(input.license_policy_id, "license_policy_id", 255),
+      policyId,
       {},
       sharedContext,
     )
@@ -3957,10 +5901,32 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       {},
       sharedContext,
     )
-    const existingAssignment = entitlementAssignments[0]
+    let existingAssignment = entitlementAssignments[0]
+    if (existingAssignment) {
+      await this.lockRows_(
+        "license_assignment",
+        [existingAssignment.id],
+        sharedContext,
+      )
+      existingAssignment = await this.retrieveLicenseAssignment(
+        existingAssignment.id,
+        { options: { refresh: true } } as any,
+        sharedContext,
+      )
+      if (
+        existingAssignment.entitlement_id !== entitlement.id ||
+        existingAssignment.license_policy_id !== policy.id
+      ) {
+        throw new MedusaError(
+          MedusaError.Types.UNEXPECTED_STATE,
+          "License assignment relationships changed unexpectedly",
+        )
+      }
+    }
     if (
       existingAssignment?.status === LicenseAssignmentStatus.ACTIVE &&
-      existingAssignment.license_pool_key_id
+      existingAssignment.license_pool_key_id &&
+      input.replace_existing !== true
     ) {
       const existingKey = await this.retrieveLicensePoolKey(
         existingAssignment.license_pool_key_id,
@@ -4054,6 +6020,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       policyExpiry && entitlementExpiry
         ? new Date(Math.min(policyExpiry.getTime(), entitlementExpiry.getTime()))
         : policyExpiry ?? entitlementExpiry
+    const previousPoolKeyId = existingAssignment?.license_pool_key_id ?? null
     const assignmentData = {
       entitlement_id: entitlement.id,
       license_policy_id: policy.id,
@@ -4062,21 +6029,81 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       idempotency_key: idempotencyKey,
       activation_count: 0,
       assigned_at: now,
+      revealed_at: null,
       expires_at: expiresAt,
       revoked_at: null,
       revoke_reason: null,
       metadata: input.metadata ?? {},
     }
-    const assignment = existingAssignment
-      ? await this.updateLicenseAssignments(
-          { id: existingAssignment.id, ...assignmentData },
+    if (existingAssignment) {
+      const staleActivations = await this.listLicenseActivations(
+        {
+          assignment_id: existingAssignment.id,
+          status: LicenseActivationStatus.ACTIVE,
+        },
+        {},
+        sharedContext,
+      )
+      if (staleActivations.length) {
+        await this.updateLicenseActivations(
+          staleActivations.map((activation) => ({
+            id: activation.id,
+            status: LicenseActivationStatus.DEACTIVATED,
+            deactivated_at: now,
+            last_seen_at: now,
+          })),
           sharedContext,
         )
-      : await this.createLicenseAssignments(assignmentData, sharedContext)
-    if (existingAssignment?.license_pool_key_id) {
+      }
+    }
+    let assignment: AnyRecord
+    if (existingAssignment) {
+      // ModuleService creates are held in MikroORM's unit of work until flush.
+      // A generated replacement key therefore has to be materialized before
+      // the transaction-bound FK update can point the existing assignment at
+      // it. This remains inside the surrounding transaction and is not a
+      // commit. Keep scalar assignment state in ModuleService, then move the
+      // already-validated relationship through the same transaction.
+      const assignmentFields: AnyRecord = { ...assignmentData }
+      delete assignmentFields.license_pool_key_id
+      await this.updateLicenseAssignments(
+        { id: existingAssignment.id, ...assignmentFields },
+        sharedContext,
+      )
+      const transactionManager = (sharedContext as AnyRecord).transactionManager
+      if (typeof transactionManager?.flush !== "function") {
+        throw new MedusaError(
+          MedusaError.Types.UNEXPECTED_STATE,
+          "License assignment key rotation requires a flushable transaction manager",
+        )
+      }
+      await transactionManager.flush()
+      const changed = await this.transactionKnex_(sharedContext)(
+        "license_assignment",
+      )
+        .where({ id: existingAssignment.id, deleted_at: null })
+        .update({ license_pool_key_id: poolKey.id, updated_at: now })
+      if (changed !== 1) {
+        throw new MedusaError(
+          MedusaError.Types.UNEXPECTED_STATE,
+          "License assignment key rotation did not update exactly one row",
+        )
+      }
+      assignment = await this.retrieveLicenseAssignment(
+        existingAssignment.id,
+        { options: { refresh: true } } as any,
+        sharedContext,
+      )
+    } else {
+      assignment = await this.createLicenseAssignments(
+        assignmentData,
+        sharedContext,
+      )
+    }
+    if (previousPoolKeyId) {
       await this.updateLicensePoolKeys(
         {
-          id: existingAssignment.license_pool_key_id,
+          id: previousPoolKeyId,
           status: LicensePoolKeyStatus.REVOKED,
           revoked_at: now,
         },
@@ -4142,12 +6169,17 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     }
     const now = new Date()
     const assignmentId = bounded(input.assignment_id, "assignment_id", 255)
-    await this.lockRows_("license_assignment", [assignmentId], sharedContext)
-    const assignment = await this.retrieveLicenseAssignment(
+    const observedAssignment = await this.retrieveLicenseAssignment(
       assignmentId,
       {},
       sharedContext,
     )
+    const { assignment, entitlement } =
+      await this.lockLicenseAssignmentGraph_(
+        assignmentId,
+        observedAssignment.entitlement_id,
+        sharedContext,
+      )
     if (assignment.status !== LicenseAssignmentStatus.ACTIVE) {
       forbidden("License assignment is not active")
     }
@@ -4156,12 +6188,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     }
     const policy = await this.retrieveLicensePolicy(
       assignment.license_policy_id,
-      {},
-      sharedContext,
-    )
-    const entitlement = await this.retrieveDigitalEntitlement(
-      assignment.entitlement_id,
-      {},
+      { options: { refresh: true } } as any,
       sharedContext,
     )
     entitlementIsUsable(entitlement, now)
@@ -4328,10 +6355,61 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     input: LicenseKeyClientInput,
     @MedusaContext() sharedContext: Context = {},
   ) {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      let assignmentId: string | undefined
+      try {
+        return await this.inTransaction_(async (transactionContext) => {
+          const resolved = await this.resolveLicenseKeyRecord(
+            input.license_key,
+            transactionContext,
+          )
+          assignmentId = resolved.assignment.id
+          await this.lockAndRevalidateResolvedLicenseKey_(
+            resolved,
+            transactionContext,
+          )
+          return this.activateLicense(
+            {
+              assignment_id: resolved.assignment.id,
+              device_id: bounded(
+                input.instance_id ?? invalid("instance_id is required"),
+                "instance_id",
+                1024,
+              ),
+              device_name: input.label,
+              ip: input.ip,
+              user_agent: input.user_agent,
+              metadata: input.metadata,
+            },
+            transactionContext,
+          )
+        }, sharedContext)
+      } catch (error) {
+        if (
+          assignmentId &&
+          error instanceof MedusaError &&
+          error.message === "License activation limit has been reached"
+        ) {
+          await this.createLicenseAuditEvents(
+            {
+              assignment_id: assignmentId,
+              action: LicenseAuditAction.VALIDATION_FAILED,
+              success: false,
+              error_code: "activation_limit_reached",
+              occurred_at: new Date(),
+              metadata: {},
+            },
+            sharedContext,
+          ).catch(() => undefined)
+        }
+        throw error
+      }
+    }
     const resolved = await this.resolveLicenseKeyRecord(
       input.license_key,
       sharedContext,
     )
+    await this.lockAndRevalidateResolvedLicenseKey_(resolved, sharedContext)
     return this.activateLicense(
       {
         assignment_id: resolved.assignment.id,
@@ -4371,14 +6449,8 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       input.license_key,
       sharedContext,
     )
-    await this.lockRows_(
-      "license_assignment",
-      [resolved.assignment.id],
-      sharedContext,
-    )
-    const assignment = await this.retrieveLicenseAssignment(
-      resolved.assignment.id,
-      {},
+    const { assignment } = await this.lockAndRevalidateResolvedLicenseKey_(
+      resolved,
       sharedContext,
     )
     const deviceFingerprint = keyedFingerprint(
@@ -4447,21 +6519,30 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     input: LicenseKeyClientInput,
     @MedusaContext() sharedContext: Context = {},
   ): Promise<{ valid: true; activation: AnyRecord; assignment: AnyRecord }> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.heartbeatLicenseByKey(input, transactionContext),
+        sharedContext,
+      )
+    }
     const now = new Date()
     const resolved = await this.resolveLicenseKeyRecord(
       input.license_key,
       sharedContext,
     )
-    if (resolved.assignment.status !== LicenseAssignmentStatus.ACTIVE) {
+    const { assignment, entitlement } =
+      await this.lockAndRevalidateResolvedLicenseKey_(resolved, sharedContext)
+    if (assignment.status !== LicenseAssignmentStatus.ACTIVE) {
       forbidden("License assignment is not active")
     }
     if (
-      resolved.assignment.expires_at &&
-      new Date(resolved.assignment.expires_at) <= now
+      assignment.expires_at &&
+      new Date(assignment.expires_at) <= now
     ) {
       forbidden("License assignment has expired")
     }
-    entitlementIsUsable(resolved.entitlement, now)
+    entitlementIsUsable(entitlement, now)
     const deviceFingerprint = keyedFingerprint(
       bounded(input.instance_id ?? invalid("instance_id is required"), "instance_id", 1024),
       this.options_.encryptionKey,
@@ -4469,7 +6550,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     )
     const activations = await this.listLicenseActivations(
       {
-        assignment_id: resolved.assignment.id,
+        assignment_id: assignment.id,
         device_fingerprint: deviceFingerprint,
         status: LicenseActivationStatus.ACTIVE,
       },
@@ -4483,7 +6564,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       { id: activations[0].id, last_seen_at: now },
       sharedContext,
     )
-    return { valid: true, activation, assignment: resolved.assignment }
+    return { valid: true, activation, assignment }
   }
 
   @InjectManager()
@@ -4583,19 +6664,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         "License assignment was not found",
       )
     }
-    let guestEntitlementId: string | undefined
-    if (!input.customer_id && input.guest_token) {
-      const access = await this.resolveGuestEntitlement(
-        input.guest_token,
-        {
-          email: input.guest_email,
-          ip: input.ip,
-          user_agent: input.user_agent,
-        },
-        sharedContext,
-      )
-      guestEntitlementId = access.entitlement.id
-    } else if (!input.customer_id) {
+    if (!input.customer_id && !input.guest_token) {
       forbidden("License ownership proof is required")
     }
     let observed: AnyRecord
@@ -4614,29 +6683,58 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       }
       throw error
     }
+    let discoveredGuestEntitlementId: string | undefined
+    if (!input.customer_id && input.guest_token) {
+      const discovery = await this.discoverGuestAccessSession_(
+        input.guest_token,
+        sharedContext,
+      )
+      discoveredGuestEntitlementId = discovery.session.entitlement_id
+      if (discoveredGuestEntitlementId !== observed.entitlement_id) {
+        return hidden()
+      }
+    }
     const observedEntitlement = await this.retrieveDigitalEntitlement(
       observed.entitlement_id,
       {},
       sharedContext,
     )
     if (
-      (input.customer_id &&
-        observedEntitlement.customer_id !== input.customer_id) ||
-      (guestEntitlementId && guestEntitlementId !== observedEntitlement.id)
+      input.customer_id &&
+      observedEntitlement.customer_id !== input.customer_id
     ) {
       return hidden()
     }
-    await this.lockRows_("license_assignment", [assignmentId], sharedContext)
-    const assignment = await this.retrieveLicenseAssignment(
-      assignmentId,
-      { options: { refresh: true } } as any,
-      sharedContext,
-    )
-    if (assignment.entitlement_id !== observedEntitlement.id) {
-      throw new MedusaError(
-        MedusaError.Types.UNEXPECTED_STATE,
-        "License assignment relationships changed unexpectedly",
+    const { assignment, entitlement } =
+      await this.lockLicenseAssignmentGraph_(
+        assignmentId,
+        observed.entitlement_id,
+        sharedContext,
       )
+    if (
+      discoveredGuestEntitlementId &&
+      discoveredGuestEntitlementId !== entitlement.id
+    ) {
+      return hidden()
+    }
+    let guestEntitlementId: string | undefined
+    if (!input.customer_id && input.guest_token) {
+      const access = await this.resolveGuestEntitlement(
+        input.guest_token,
+        {
+          email: input.guest_email,
+          ip: input.ip,
+          user_agent: input.user_agent,
+        },
+        sharedContext,
+      )
+      guestEntitlementId = access.entitlement.id
+    }
+    if (
+      (input.customer_id && entitlement.customer_id !== input.customer_id) ||
+      (guestEntitlementId && guestEntitlementId !== entitlement.id)
+    ) {
+      return hidden()
     }
     if (assignment.status !== LicenseAssignmentStatus.ACTIVE) {
       forbidden("License assignment is not active")
@@ -4644,7 +6742,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     if (assignment.expires_at && new Date(assignment.expires_at) <= new Date()) {
       forbidden("License assignment has expired")
     }
-    entitlementIsUsable(observedEntitlement, new Date())
+    entitlementIsUsable(entitlement, new Date())
     if (!assignment.license_pool_key_id) {
       throw new MedusaError(
         MedusaError.Types.UNEXPECTED_STATE,
@@ -4653,7 +6751,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     }
     const key = await this.retrieveLicensePoolKey(
       assignment.license_pool_key_id,
-      {},
+      { options: { refresh: true } } as any,
       sharedContext,
     )
     if (key.status !== LicensePoolKeyStatus.ASSIGNED) {
@@ -4701,6 +6799,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
         default_download_limit: this.options_.defaultDownloadLimit,
         default_grant_ttl_seconds: this.options_.defaultGrantTtlSeconds,
         max_grant_ttl_seconds: this.options_.maxGrantTtlSeconds,
+        guest_access_ttl_seconds: this.options_.guestAccessTtlSeconds,
         max_upload_size_bytes: this.options_.maxUploadSizeBytes,
         allow_guest_access: this.options_.allowGuestAccess,
         storage_namespace_fingerprint:
@@ -4785,7 +6884,7 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       normalized.default_grant_ttl_seconds ??
         Number(current.default_grant_ttl_seconds),
       "default_grant_ttl_seconds",
-      { max: this.options_.maxGrantTtlSeconds },
+      { max: this.options_.defaultGrantTtlSeconds },
     )
     const maxTtl = positiveInteger(
       normalized.max_grant_ttl_seconds ?? Number(current.max_grant_ttl_seconds),
@@ -4795,12 +6894,35 @@ export default class DigitalDownloadsModuleService extends MedusaService({
     if (defaultTtl > maxTtl) {
       invalid("default_grant_ttl_seconds cannot exceed max_grant_ttl_seconds")
     }
+    const effectiveCurrentGuestAccessTtl = effectiveGuestAccessTtl(
+      current.guest_access_ttl_seconds,
+      this.options_.guestAccessTtlSeconds,
+    )
+    const guestAccessTtl = positiveInteger(
+      normalized.guest_access_ttl_seconds ?? effectiveCurrentGuestAccessTtl,
+      "guest_access_ttl_seconds",
+      {
+        max: guestAccessPolicyTtl(
+          this.options_.guestAccessTtlSeconds,
+          "guestAccessTtlSeconds",
+        ),
+      },
+    )
+    if (guestAccessTtl < MIN_GUEST_ACCESS_TTL_SECONDS) {
+      invalid(
+        `guest_access_ttl_seconds must be at least ${MIN_GUEST_ACCESS_TTL_SECONDS}`,
+      )
+    }
+    normalized.guest_access_ttl_seconds = guestAccessTtl
     if (normalized.max_upload_size_bytes !== undefined) {
       positiveInteger(
         normalized.max_upload_size_bytes,
         "max_upload_size_bytes",
         { max: this.options_.maxUploadSizeBytes },
       )
+    }
+    if (this.options_.allowGuestAccess === false) {
+      normalized.allow_guest_access = false
     }
     if (normalized.event_retention_days !== undefined) {
       positiveInteger(normalized.event_retention_days, "event_retention_days", {
@@ -4936,6 +7058,74 @@ export default class DigitalDownloadsModuleService extends MedusaService({
       claimed.push(changed)
     }
     return claimed
+  }
+
+  @InjectManager()
+  async transitionClaimedNotificationDelivery(
+    deliveryId: string,
+    workerId: string,
+    update: AnyRecord,
+    @MedusaContext() sharedContext: Context = {},
+  ): Promise<AnyRecord | null> {
+    if (!(sharedContext as AnyRecord).transactionManager) {
+      return this.inTransaction_(
+        (transactionContext) =>
+          this.transitionClaimedNotificationDelivery(
+            deliveryId,
+            workerId,
+            update,
+            transactionContext,
+          ),
+        sharedContext,
+      )
+    }
+
+    const id = bounded(deliveryId, "notification delivery id", 255)
+    const worker = bounded(workerId, "worker id", 255)
+    const nextState = update.state as NotificationDeliveryState | undefined
+    if (
+      nextState !== undefined &&
+      ![
+          NotificationDeliveryState.SENT,
+          NotificationDeliveryState.FAILED,
+          NotificationDeliveryState.DEAD_LETTER,
+          NotificationDeliveryState.CANCELED,
+        ].includes(nextState)
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Claimed notification delivery update has an invalid state transition",
+      )
+    }
+
+    await this.lockRows_("notification_delivery", [id], sharedContext)
+    const current = await this.retrieveNotificationDelivery(
+      id,
+      { options: { refresh: true } } as any,
+      sharedContext,
+    )
+    if (
+      [
+        NotificationDeliveryState.SENT,
+        NotificationDeliveryState.CANCELED,
+        NotificationDeliveryState.DEAD_LETTER,
+      ].includes(current.state)
+    ) {
+      return null
+    }
+    if (
+      current.state !== NotificationDeliveryState.PROCESSING ||
+      current.lease_owner !== worker
+    ) {
+      return null
+    }
+
+    const { id: ignoredId, ...changes } = update
+    void ignoredId
+    return this.updateNotificationDeliveries(
+      { ...changes, id },
+      sharedContext,
+    )
   }
 
   @InjectManager()

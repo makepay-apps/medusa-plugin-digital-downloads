@@ -17,6 +17,7 @@ import type {
   ProductConfigFilters,
   ProductConfigInput,
   ReleaseInput,
+  ReleasePatchInput,
   ReportSummary,
   UploadIntent,
   UploadPurpose,
@@ -124,6 +125,10 @@ const normalizeSettings = (value: unknown): DigitalDownloadSettings => {
     max_grant_ttl_seconds: numericValue(
       settings.max_grant_ttl_seconds,
       86_400
+    ),
+    guest_access_ttl_seconds: numericValue(
+      settings.guest_access_ttl_seconds,
+      2_592_000
     ),
     max_upload_size_bytes: maxUploadBytes,
     allow_guest_access: settings.allow_guest_access !== false,
@@ -255,6 +260,14 @@ export const digitalDownloadsApi = {
     return unwrap<DigitalRelease>(response, ["release"])
   },
 
+  async updateRelease(id: string, input: ReleasePatchInput) {
+    const response = await sdk.client.fetch<Record<string, unknown>>(
+      `${API_ROOT}/releases/${id}`,
+      { method: "PATCH", body: input }
+    )
+    return unwrap<DigitalRelease>(response, ["release"])
+  },
+
   async publishRelease(id: string) {
     return sdk.client.fetch(`${API_ROOT}/releases/${id}/publish`, {
       method: "POST",
@@ -291,13 +304,17 @@ export const digitalDownloadsApi = {
     })
   },
 
-  async reissueEntitlement(id: string) {
+  async reissueEntitlement(
+    id: string,
+    input: { expires_at?: string | null } = {}
+  ) {
     return sdk.client.fetch(`${API_ROOT}/entitlements/${id}/reissue`, {
       method: "POST",
       body: {
         notify: true,
         reset_downloads: false,
         rotate_guest_token: true,
+        ...input,
       },
     })
   },

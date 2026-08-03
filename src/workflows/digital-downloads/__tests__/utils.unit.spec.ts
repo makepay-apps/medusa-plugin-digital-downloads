@@ -55,6 +55,7 @@ describe("digital download orchestration utilities", () => {
     const snapshot = buildPurchaseSnapshot({
       order: {
         id: "order_1",
+        display_id: 1042,
         currency_code: "usd",
         created_at: "2026-07-31T00:00:00.000Z",
       },
@@ -64,6 +65,10 @@ describe("digital download orchestration utilities", () => {
         title: "Album",
         quantity: 2,
         unit_price: 1000,
+        metadata: {
+          refresh_token: "customer-controlled-secret",
+          nested: { authorization: "customer-controlled-authorization" },
+        },
       },
       digitalProduct: {
         id: "dprod_1",
@@ -91,6 +96,7 @@ describe("digital download orchestration utilities", () => {
     expect(snapshot).toMatchObject({
       schema_version: 1,
       purchased_at: "2026-07-31T00:00:00.000Z",
+      order: { id: "order_1", display_id: 1042 },
       line_item: { id: "item_1", unit_index: 1, variant_id: "variant_1" },
       release: { id: "drel_1", version: "1.0" },
       assets: [{ id: "asset_1" }],
@@ -98,16 +104,57 @@ describe("digital download orchestration utilities", () => {
     expect(JSON.stringify(snapshot)).not.toContain("storage_key")
     expect(JSON.stringify(snapshot)).not.toContain("private/album.zip")
     expect(JSON.stringify(snapshot)).not.toContain("never")
+    expect(JSON.stringify(snapshot)).not.toContain("customer-controlled")
+    expect(snapshot.line_item).not.toHaveProperty("metadata")
+    expect(snapshot.digital_product).not.toHaveProperty("metadata")
   })
 
   it("recursively strips secrets while retaining public metadata", () => {
     expect(
       sanitizeForPurchaseSnapshot({
         title: "Public",
-        nested: { password: "hidden", region: "eu" },
+        nested: {
+          password: "hidden",
+          client_secret: "hidden",
+          api_key: "hidden",
+          authorization: "hidden",
+          region: "eu",
+        },
         credentials: { access_key: "hidden" },
       })
     ).toEqual({ title: "Public", nested: { region: "eu" } })
+  })
+
+  it("bounds adversarial depth without recursive overflow", () => {
+    const input: Record<string, unknown> = {}
+    let cursor = input
+    for (let depth = 0; depth < 10_000; depth += 1) {
+      const next: Record<string, unknown> = {}
+      cursor.next = next
+      cursor = next
+    }
+
+    expect(() => sanitizeForPurchaseSnapshot(input)).not.toThrow()
+    expect(JSON.stringify(sanitizeForPurchaseSnapshot(input)).length).toBeLessThan(
+      1_000,
+    )
+  })
+
+  it("bounds collection, string, and serialized snapshot amplification", () => {
+    const sanitized = sanitizeForPurchaseSnapshot({
+      title: "x".repeat(100_000),
+      items: Array.from({ length: 1_000 }, (_, index) => ({
+        index,
+        value: "y".repeat(4_096),
+      })),
+    })
+    const serialized = JSON.stringify(sanitized)
+
+    expect(Buffer.byteLength(sanitized.title, "utf8")).toBeLessThanOrEqual(
+      2_048,
+    )
+    expect(sanitized.items).toHaveLength(64)
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(64 * 1_024)
   })
 
   it("implements cancellation/refund policy decisions", () => {

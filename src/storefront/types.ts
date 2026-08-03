@@ -183,7 +183,7 @@ export interface DigitalAccessGrant {
   action: Extract<DigitalDeliveryType, "download" | "stream">
   url: string
   method: "GET"
-  headers: { authorization: string }
+  headers: Record<string, string> & { authorization: string }
   expires_at: ISODateString
   filename?: string | null
   mime_type?: string | null

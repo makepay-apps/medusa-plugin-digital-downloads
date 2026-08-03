@@ -37,9 +37,8 @@ const NotificationDelivery = model
   })
   .indexes([
     {
-      name: "UQ_notification_delivery_natural_key",
+      name: "IDX_notification_delivery_natural_lookup",
       on: ["entitlement_id", "template", "recipient_hash"],
-      unique: true,
     },
     {
       name: "IDX_notification_delivery_claim",

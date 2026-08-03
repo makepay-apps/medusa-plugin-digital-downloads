@@ -123,6 +123,9 @@ try {
     ".medusa/server/src/storefront/index.d.ts",
     ".medusa/server/src/modules/digital-downloads/migrations/Migration20260731221936.js",
     ".medusa/server/src/modules/digital-downloads/migrations/Migration20260801114300.js",
+    ".medusa/server/src/modules/digital-downloads/migrations/Migration20260803090000.js",
+    ".medusa/server/src/modules/digital-downloads/migrations/Migration20260803183000.js",
+    ".medusa/server/src/modules/digital-downloads/migrations/Migration20260803200000.js",
   ]
   for (const requiredPath of requiredPaths) {
     if (!packedPaths.has(requiredPath)) {
@@ -244,12 +247,19 @@ try {
     path.join(consumer, "consumer.ts"),
     `import digitalDownloadsModule, {
   DIGITAL_DOWNLOADS_MODULE,
+  DEFAULT_GUEST_ACCESS_TTL_SECONDS,
   DigitalDownloadsModuleService,
   DigitalProductStatus,
   DigitalStorageProvider,
+  MAX_GUEST_ACCESS_TTL_SECONDS,
+  MIN_GUEST_ACCESS_TTL_SECONDS,
   ProtectedLocalStorageDriver,
+  type ActivateGuestAccessSessionInput,
   type CreateDigitalProductConfigInput,
+  type CreateGuestAccessSessionInput,
   type DigitalDownloadsModuleOptions,
+  type FinalizeNotificationGuestAccessInput,
+  type FinalizeNotificationGuestAccessResult,
   type StorageDriver,
 } from "@makecrypto/medusa-plugin-digital-downloads/modules/digital-downloads"
 import legacyDigitalDownloadsModule from "@makecrypto/medusa-plugin-digital-downloads/.medusa/server/src/modules/digital-downloads"
@@ -304,6 +314,26 @@ const client: DigitalDownloadsClient = createDigitalDownloadsFetchClient({
   baseUrl: "http://localhost:9000",
 })
 const query: DigitalLibraryQuery = { limit: 10 }
+const service = {} as DigitalDownloadsModuleService
+const guestSessionInput: CreateGuestAccessSessionInput = {
+  entitlement_id: "dent_123",
+  idempotency_key: "notification-attempt-123",
+  expected_guest_access_epoch: 2,
+}
+const guestActivationInput: ActivateGuestAccessSessionInput = {
+  expected_guest_access_epoch: 2,
+  notification_delivery_id: "dnotif_123",
+}
+const guestFinalizationInput: FinalizeNotificationGuestAccessInput = {
+  delivery_id: "dnotif_123",
+  entitlement_id: "dent_123",
+  session_id: "daccess_123",
+  expected_guest_access_epoch: 2,
+  worker_id: "notification-worker-123",
+  attempt: 1,
+}
+const guestFinalization: Promise<FinalizeNotificationGuestAccessResult> =
+  service.finalizeNotificationGuestAccess(guestFinalizationInput)
 
 void options
 void workflowInput
@@ -311,12 +341,23 @@ void issuanceInput
 void driver
 void client
 void query
+void service.createGuestAccessSession(guestSessionInput)
+void service.activateGuestAccessSession("daccess_123", guestActivationInput)
+void service.transitionClaimedNotificationDelivery(
+  "dnotif_123",
+  "notification-worker-123",
+  { state: "canceled" },
+)
+void guestFinalization
 void digitalDownloadsModule
 void legacyDigitalDownloadsModule
 void digitalFulfillmentProvider
 void DigitalFulfillmentProviderService.identifier
 void DigitalDownloadsProvider
 void DIGITAL_DOWNLOADS_MODULE
+void DEFAULT_GUEST_ACCESS_TTL_SECONDS
+void MAX_GUEST_ACCESS_TTL_SECONDS
+void MIN_GUEST_ACCESS_TTL_SECONDS
 void DIGITAL_DOWNLOAD_EVENTS.ENTITLEMENT_ISSUED
 void aggregateRefunds({ refund_total: 0 })
 void createDigitalProductWorkflow

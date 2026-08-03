@@ -216,6 +216,8 @@ export interface DigitalDownloadsModuleOptions {
   defaultDownloadLimit?: number | null
   defaultGrantTtlSeconds?: number
   maxGrantTtlSeconds?: number
+  /** Lifetime of guest purchase-access capabilities; independent of asset grants. */
+  guestAccessTtlSeconds?: number
   maxUploadSizeBytes?: number
   allowedMimeTypes?: string[]
   allowGuestAccess?: boolean
@@ -242,6 +244,7 @@ export interface ResolvedDigitalDownloadsModuleOptions {
   defaultDownloadLimit: number | null
   defaultGrantTtlSeconds: number
   maxGrantTtlSeconds: number
+  guestAccessTtlSeconds: number
   maxUploadSizeBytes: number
   allowedMimeTypes: string[]
   allowGuestAccess: boolean
@@ -293,6 +296,8 @@ export interface IssueEntitlementRowInput {
   license_activation_limit?: number | null
   snapshot?: JsonObject
   metadata?: JsonObject
+  /** Internal orchestration control. Omitted values preserve direct-call behavior. */
+  create_guest_access?: boolean
 }
 
 export interface IssueOrderEntitlementsInput {
@@ -302,6 +307,64 @@ export interface IssueOrderEntitlementsInput {
   customer_email: string
   customer_name?: string | null
   items: IssueOrderEntitlementItemInput[]
+}
+
+export interface ReissueEntitlementInput {
+  entitlementId?: string
+  entitlement_id?: string
+  reason?: string
+  reset_downloads?: boolean
+  rotate_guest_token?: boolean
+  expires_at?: Date | string | null
+  expiresAt?: Date | string | null
+  create_guest_access?: boolean
+  notify?: boolean
+}
+
+export interface RevokeEntitlementWithNotificationInput {
+  entitlement_id: string
+  reason: string
+  actor?: { type?: string; id?: string }
+  notify?: boolean
+  final_status?: DigitalEntitlementStatus.REVOKED | DigitalEntitlementStatus.REFUNDED
+}
+
+export interface RevokeOrderEntitlementsInput {
+  order_id: string
+  line_item_ids?: string[]
+  reason: string
+  trigger?: "refund" | "cancellation" | "chargeback" | "manual"
+  notify?: boolean
+  actor?: { type?: string; id?: string }
+}
+
+export interface ListLifecycleNotificationRepairCandidatesInput {
+  limit?: number
+  as_of?: Date | string
+}
+
+export interface LifecycleNotificationRepairCandidate {
+  id: string
+  status:
+    | DigitalEntitlementStatus.EXPIRED
+    | DigitalEntitlementStatus.REVOKED
+    | DigitalEntitlementStatus.REFUNDED
+  reason: string
+}
+
+export interface ExpireEntitlementIfDueInput {
+  entitlement_id: string
+  as_of: Date | string
+  reason?: string
+}
+
+export interface RepairLifecycleNotificationInput {
+  entitlement_id: string
+  expected_status:
+    | DigitalEntitlementStatus.EXPIRED
+    | DigitalEntitlementStatus.REVOKED
+    | DigitalEntitlementStatus.REFUNDED
+  reason: string
 }
 
 export interface CreateDownloadGrantInput {
@@ -362,6 +425,8 @@ export interface AssignLicenseKeyInput {
   license_policy_id: string
   idempotency_key: string
   external_key?: string
+  /** Internal reissue control: rotate an otherwise active assignment. */
+  replace_existing?: boolean
   metadata?: JsonObject
 }
 
@@ -377,12 +442,44 @@ export interface ActivateLicenseInput {
 export interface CreateGuestAccessSessionInput {
   entitlement_id: string
   idempotency_key: string
+  /** Internal delivery state; public issuance defaults to active. */
   initial_status?: AccessSessionStatus.ACTIVE | AccessSessionStatus.PENDING
+  /** Internal generation fence used by notification delivery. */
+  expected_guest_access_epoch?: number
   ttl_seconds?: number
   bind_ip?: string
   bind_user_agent?: string
   metadata?: JsonObject
 }
+
+export interface ActivateGuestAccessSessionInput {
+  /** Internal generation fence used by notification delivery. */
+  expected_guest_access_epoch?: number
+  /** Binds notification-created sessions to their owning outbox row. */
+  notification_delivery_id?: string
+}
+
+export interface FinalizeNotificationGuestAccessInput {
+  delivery_id: string
+  entitlement_id: string
+  session_id: string
+  expected_guest_access_epoch: number
+  worker_id: string
+  attempt: number
+  provider_message_id?: string | null
+}
+
+export type FinalizeNotificationGuestAccessResult =
+  | {
+      outcome: "sent"
+      delivery: Record<string, unknown>
+      session: Record<string, unknown>
+    }
+  | {
+      outcome: "superseded"
+      delivery: Record<string, unknown>
+      session: Record<string, unknown>
+    }
 
 export interface LicenseKeyClientInput {
   license_key: string
@@ -692,6 +789,9 @@ export declare function validateLicensePattern(pattern: string): void
 export declare function generateLicenseKey(pattern?: string): string
 export declare function normalizeLicenseKey(value: string): string
 export declare function licenseKeyHint(value: string): string
+export declare const MIN_GUEST_ACCESS_TTL_SECONDS: number
+export declare const DEFAULT_GUEST_ACCESS_TTL_SECONDS: number
+export declare const MAX_GUEST_ACCESS_TTL_SECONDS: number
 export declare function resolveDigitalDownloadsOptions(
   options?: DigitalDownloadsModuleOptions,
   env?: NodeJS.ProcessEnv,
@@ -825,19 +925,47 @@ export declare class DigitalDownloadsModuleService {
     actor?: { type?: string; id?: string },
     sharedContext?: DigitalDownloadsServiceContext,
   ): Promise<DigitalRecord>
+  revokeEntitlementWithNotification(
+    input: RevokeEntitlementWithNotificationInput,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<{ entitlement: DigitalRecord; delivery?: DigitalRecord }>
+  revokeOrderEntitlements(
+    input: RevokeOrderEntitlementsInput,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<{ revoked: DigitalRecord[]; deliveries: DigitalRecord[] }>
+  listLifecycleNotificationRepairCandidates(
+    input?: ListLifecycleNotificationRepairCandidatesInput,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<LifecycleNotificationRepairCandidate[]>
+  expireEntitlement(
+    id: string,
+    reason?: string,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<{ entitlement: DigitalRecord; delivery?: DigitalRecord }>
+  expireEntitlementIfDue(
+    input: ExpireEntitlementIfDueInput,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<{
+    entitlement: DigitalRecord
+    delivery?: DigitalRecord
+    expired: boolean
+  }>
+  repairLifecycleNotification(
+    input: RepairLifecycleNotificationInput,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<{
+    entitlement: DigitalRecord
+    delivery?: DigitalRecord
+    repaired: boolean
+  }>
   reissueEntitlement(
-    input: {
-      entitlementId?: string
-      entitlement_id?: string
-      reason?: string
-      reset_downloads?: boolean
-      rotate_guest_token?: boolean
-      notify?: boolean
-    },
+    input: ReissueEntitlementInput,
     sharedContext?: DigitalDownloadsServiceContext,
   ): Promise<{
     entitlement: DigitalRecord
     guest_access?: { session: DigitalRecord; token: string }
+    guest_access_required?: boolean
+    delivery?: DigitalRecord
   }>
   createDownloadGrant(
     input: CreateDownloadGrantInput,
@@ -854,8 +982,13 @@ export declare class DigitalDownloadsModuleService {
   ): Promise<DigitalRecord>
   activateGuestAccessSession(
     sessionId: string,
+    input?: ActivateGuestAccessSessionInput,
     sharedContext?: DigitalDownloadsServiceContext,
   ): Promise<DigitalRecord>
+  finalizeNotificationGuestAccess(
+    input: FinalizeNotificationGuestAccessInput,
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<FinalizeNotificationGuestAccessResult>
   resolveGuestEntitlement(
     rawToken: string,
     request?: { ip?: string; user_agent?: string; email?: string },
@@ -1004,6 +1137,12 @@ export declare class DigitalDownloadsModuleService {
     deliveryId: string,
     workerId: string,
     options?: { lease_seconds?: number; expected_lease_owner?: string },
+    sharedContext?: DigitalDownloadsServiceContext,
+  ): Promise<DigitalRecord | null>
+  transitionClaimedNotificationDelivery(
+    deliveryId: string,
+    workerId: string,
+    update: DigitalRecord,
     sharedContext?: DigitalDownloadsServiceContext,
   ): Promise<DigitalRecord | null>
   getDigitalDownloadsReport(

@@ -119,6 +119,8 @@ export interface ReissueEntitlementWorkflowInput {
   resetDownloads?: boolean
   rotate_guest_token?: boolean
   rotateGuestToken?: boolean
+  expires_at?: string | null
+  expiresAt?: string | null
   notify?: boolean
 }
 
@@ -338,7 +340,12 @@ export declare const cleanupOrphanedDigitalProductsWorkflow: ReturnWorkflow<
 
 export declare const expireEntitlementsWorkflow: ReturnWorkflow<
   ExpireEntitlementsWorkflowInput,
-  { expired: UnknownRecord[]; notification_events: UnknownRecord[]; as_of: string },
+  {
+    expired: UnknownRecord[]
+    repaired: UnknownRecord[]
+    notification_events: UnknownRecord[]
+    as_of: string
+  },
   []
 >
 

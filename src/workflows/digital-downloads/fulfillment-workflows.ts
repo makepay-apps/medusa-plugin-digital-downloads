@@ -48,6 +48,7 @@ import {
 
 const ORDER_FIELDS = [
   "id",
+  "display_id",
   "email",
   "customer_id",
   "customer.id",
@@ -339,6 +340,18 @@ async function enqueueDeliveryNotification(
     return existing[0]
   }
 
+  const guestAccessEpoch = Number(entitlement.guest_access_epoch ?? 0)
+  if (
+    !Number.isSafeInteger(guestAccessEpoch) ||
+    guestAccessEpoch < 0 ||
+    guestAccessEpoch > 2_147_483_647
+  ) {
+    throw new MedusaError(
+      MedusaError.Types.UNEXPECTED_STATE,
+      "Guest access epoch is invalid"
+    )
+  }
+
   try {
     return await service.createNotificationDeliveries({
       entitlement_id: entitlement.id,
@@ -353,7 +366,12 @@ async function enqueueDeliveryNotification(
         entitlement_id: entitlement.id,
         order_id: entitlement.order_id,
         digital_product_id: entitlement.digital_product_id,
-        guest_access: !entitlement.customer_id,
+        ...(!entitlement.customer_id
+          ? {
+              guest_access: true,
+              guest_access_epoch: guestAccessEpoch,
+            }
+          : {}),
       },
       metadata: {},
     })
@@ -509,7 +527,6 @@ export const issueOrderEntitlementsStep = createStep(
       const active =
         digitalProduct.status === DigitalProductStatus.ACTIVE ||
         digitalProduct.status === "active"
-      const releaseRequired = deliveryType !== "license"
       const configuredFulfillmentStrategy =
         digitalProduct.metadata?.fulfillment_strategy
       const fulfillmentStrategy = isFulfillmentStrategy(
@@ -553,6 +570,9 @@ export const issueOrderEntitlementsStep = createStep(
           metadata: {
             workflow_source: input.source ?? "order.placed",
           },
+          // The notification worker is the sole issuer of the guest token sent
+          // to the customer. Direct service callers retain the legacy default.
+          create_guest_access: false,
         }
         const operation = await upsertFulfillmentOperation(service, row, row)
 
@@ -568,7 +588,7 @@ export const issueOrderEntitlementsStep = createStep(
           }
         }
 
-        if (!active || (releaseRequired && !release)) {
+        if (!active || !release) {
           const error = new Error(
             !active
               ? "Digital product is not active"

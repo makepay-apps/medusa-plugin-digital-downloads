@@ -516,6 +516,52 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
         ).rejects.toThrow(/exhausted/);
       });
 
+      it("returns typed 416 range failures without reserving or consuming the grant", async () => {
+        const { asset, entitlement } = await downloadFixture({
+          downloadLimit: 1,
+        });
+        const issued = await service.createDownloadGrant({
+          entitlement_id: entitlement.id,
+          asset_id: asset.id,
+          idempotency_key: "unsatisfiable-range-does-not-consume",
+          max_uses: 1,
+        });
+        const totalSize = Number(asset.size_bytes);
+
+        for (const testCase of [
+          {
+            header: `bytes=${totalSize}-`,
+            code: "range_not_satisfiable",
+          },
+          { header: "bytes=-0", code: "invalid_range" },
+        ]) {
+          await expect(
+            service.redeemDownloadGrant(issued.token, {
+              asset_id: asset.id,
+              range_header: testCase.header,
+            }),
+          ).rejects.toMatchObject({
+            status: 416,
+            statusCode: 416,
+            code: testCase.code,
+            details: { total_size: totalSize },
+          });
+        }
+
+        expect(
+          await rawService.retrieveDownloadGrant(issued.grant.id),
+        ).toMatchObject({ use_count: 0, reservation_id: null });
+        expect(
+          await rawService.retrieveDigitalEntitlement(entitlement.id),
+        ).toMatchObject({ download_count: 0 });
+        expect(
+          await rawService.listDownloadEvents({
+            grant_id: issued.grant.id,
+            event_type: DownloadEventType.TRANSFER_STARTED,
+          }),
+        ).toHaveLength(0);
+      });
+
       it("caps range continuations by both request count and cumulative requested bytes", async () => {
         const body = Buffer.alloc(100, 0x61);
 
@@ -987,6 +1033,39 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
           lease_owner: owned.lease_owner,
           attempt_count: 1,
         });
+      });
+
+      it("allows separately versioned reissue notifications for one entitlement", async () => {
+        const { entitlement } = await downloadFixture();
+        const recipientHash = await service.recipientHash("owner@example.test");
+        const common = {
+          entitlement_id: entitlement.id,
+          channel: "email",
+          template: "digital-downloads-reissued",
+          recipient_hash: recipientHash,
+          state: NotificationDeliveryState.PENDING,
+          attempt_count: 0,
+          max_attempts: 8,
+          payload: {},
+          metadata: {},
+        };
+
+        const first = await rawService.createNotificationDeliveries({
+          ...common,
+          idempotency_key: `reissue:${entitlement.id}:v1`,
+        });
+        const second = await rawService.createNotificationDeliveries({
+          ...common,
+          idempotency_key: `reissue:${entitlement.id}:v2`,
+        });
+
+        expect(first.id).not.toBe(second.id);
+        await expect(
+          rawService.listNotificationDeliveries({
+            entitlement_id: entitlement.id,
+            template: "digital-downloads-reissued",
+          }),
+        ).resolves.toHaveLength(2);
       });
     });
   },

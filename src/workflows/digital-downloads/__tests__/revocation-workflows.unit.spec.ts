@@ -9,6 +9,7 @@ import {
   aggregateRefunds,
   orderTotalForRefundPolicy,
   reissueEntitlementWorkflow,
+  revokeEntitlementWorkflow,
   revokeOrderEntitlementsWorkflow,
 } from "../revocation-workflows"
 
@@ -21,14 +22,14 @@ function revocationDependencies(paymentOrderId?: string) {
     status: "active",
   }
   const service = {
-    listDigitalEntitlements: jest.fn().mockResolvedValue([entitlement]),
-    revokeEntitlement: jest.fn().mockResolvedValue({
-      ...entitlement,
-      status: "revoked",
-    }),
-    updateDigitalEntitlements: jest.fn(async (data) => ({
-      ...entitlement,
-      ...data,
+    revokeOrderEntitlements: jest.fn(async (input) => ({
+      revoked: [
+        {
+          ...entitlement,
+          status: input.trigger === "refund" ? "refunded" : "revoked",
+        },
+      ],
+      deliveries: [],
     })),
   }
   const query = {
@@ -61,6 +62,10 @@ function revocationDependencies(paymentOrderId?: string) {
     }),
   }
   const container = createMedusaContainer()
+  const locking = {
+    acquire: jest.fn().mockResolvedValue(undefined),
+    release: jest.fn().mockResolvedValue(undefined),
+  }
   container.register({
     [ContainerRegistrationKeys.QUERY]: asValue(query),
     [ContainerRegistrationKeys.LOGGER]: asValue({
@@ -69,10 +74,7 @@ function revocationDependencies(paymentOrderId?: string) {
       error: jest.fn(),
       debug: jest.fn(),
     }),
-    [Modules.LOCKING]: asValue({
-      acquire: jest.fn().mockResolvedValue(undefined),
-      release: jest.fn().mockResolvedValue(undefined),
-    }),
+    [Modules.LOCKING]: asValue(locking),
     [Modules.EVENT_BUS]: asValue({
       emit: jest.fn().mockResolvedValue(undefined),
       clearGroupedEvents: jest.fn().mockResolvedValue(undefined),
@@ -80,7 +82,7 @@ function revocationDependencies(paymentOrderId?: string) {
     }),
     [DIGITAL_DOWNLOADS_MODULE]: asValue(service),
   })
-  return { container, query, service }
+  return { container, query, service, locking }
 }
 
 describe("refund projections", () => {
@@ -131,8 +133,7 @@ describe("revokeOrderEntitlementsWorkflow payment binding", () => {
     expect(response.errors[0]?.error).toMatchObject({
       message: expect.stringContaining("does not belong to the supplied order"),
     })
-    expect(deps.service.listDigitalEntitlements).not.toHaveBeenCalled()
-    expect(deps.service.revokeEntitlement).not.toHaveBeenCalled()
+    expect(deps.service.revokeOrderEntitlements).not.toHaveBeenCalled()
     expect(deps.query.graph).toHaveBeenCalledTimes(1)
   })
 
@@ -155,8 +156,7 @@ describe("revokeOrderEntitlementsWorkflow payment binding", () => {
     expect(response.errors[0]?.error).toMatchObject({
       message: expect.stringContaining("Payment is not linked to an order"),
     })
-    expect(deps.service.listDigitalEntitlements).not.toHaveBeenCalled()
-    expect(deps.service.revokeEntitlement).not.toHaveBeenCalled()
+    expect(deps.service.revokeOrderEntitlements).not.toHaveBeenCalled()
     expect(deps.query.graph).toHaveBeenCalledTimes(1)
   })
 
@@ -179,22 +179,47 @@ describe("revokeOrderEntitlementsWorkflow payment binding", () => {
       order_id: "order_bound",
       revoked: [{ id: "dent_bound", status: "refunded" }],
     })
-    expect(deps.service.revokeEntitlement).toHaveBeenCalledWith(
-      "dent_bound",
-      "Payment was refunded",
-      { type: "workflow", id: "refund" }
-    )
+    expect(deps.service.revokeOrderEntitlements).toHaveBeenCalledWith({
+      order_id: "order_bound",
+      line_item_ids: [],
+      reason: "Payment was refunded",
+      trigger: "refund",
+      notify: true,
+      actor: { type: "workflow", id: "refund" },
+    })
     expect(deps.query.graph.mock.calls.map(([input]) => input.entity)).toEqual([
       "payments",
       "order",
     ])
   })
+
+  it("uses the fulfillment order lock after resolving a payment-only input", async () => {
+    const deps = revocationDependencies("order_bound")
+
+    await revokeOrderEntitlementsWorkflow(deps.container).run({
+      input: {
+        payment_id: "pay_bound",
+        trigger: "chargeback",
+        policy: "all",
+        reason: "Payment was disputed",
+      },
+      context: { transactionId: "test:revocation:shared-order-lock" },
+    })
+
+    expect(JSON.stringify(deps.locking.acquire.mock.calls)).toContain(
+      "digital-downloads:order:order_bound",
+    )
+  })
 })
 
 describe("reissueEntitlementWorkflow", () => {
-  it("propagates reset/rotation flags without persisting the guest token", async () => {
-    const rawToken = "dda_reissue_return_only_capability"
-    const deliveries: any[] = []
+  it("defers guest capability issuance and forwards the exact future deadline", async () => {
+    const delivery = {
+      id: "ndel_reissue",
+      idempotency_key:
+        "dent_reissue:reissued:c549688c-c14f-4a0a-b4eb-f9a54ea50e26",
+      payload: { guest_access: true },
+    }
     const service = {
       reissueEntitlement: jest.fn().mockResolvedValue({
         entitlement: {
@@ -203,23 +228,15 @@ describe("reissueEntitlementWorkflow", () => {
           customer_id: null,
           customer_email: "guest@example.com",
           updated_at: "2026-07-31T22:00:00.000Z",
+          metadata: {
+            last_reissue_id: "c549688c-c14f-4a0a-b4eb-f9a54ea50e26",
+            last_reissued_at: "2026-07-31T22:00:01.000Z",
+          },
           snapshot: {},
         },
-        guest_access: {
-          session: {
-            id: "dasess_reissue",
-            idempotency_key: "reissue:dent_reissue:nonce",
-          },
-          token: rawToken,
-        },
+        guest_access_required: true,
+        delivery,
       }),
-      listNotificationDeliveries: jest.fn().mockResolvedValue([]),
-      createNotificationDeliveries: jest.fn(async (data) => {
-        const delivery = { id: "ndel_reissue", ...data }
-        deliveries.push(delivery)
-        return delivery
-      }),
-      recipientHash: jest.fn().mockResolvedValue("recipient_hash"),
     }
     const eventBus = {
       emit: jest.fn().mockResolvedValue(undefined),
@@ -250,6 +267,7 @@ describe("reissueEntitlementWorkflow", () => {
         reason: "Customer requested a reset",
         reset_downloads: true,
         rotate_guest_token: true,
+        expires_at: "2026-10-15T12:34:56.000Z",
         notify: true,
       },
       context: { transactionId: "test:reissue:flags-and-capability" },
@@ -260,18 +278,72 @@ describe("reissueEntitlementWorkflow", () => {
       reason: "Customer requested a reset",
       reset_downloads: true,
       rotate_guest_token: true,
+      expires_at: "2026-10-15T12:34:56.000Z",
+      create_guest_access: false,
       notify: true,
     })
     expect(result).toMatchObject({
       entitlement: { id: "dent_reissue" },
       delivery: { id: "ndel_reissue" },
     })
-    expect(JSON.stringify(result)).not.toContain(rawToken)
-    expect(deliveries[0].payload).toMatchObject({
+    expect(delivery.payload).toMatchObject({
       guest_access: true,
-      guest_access_idempotency_key: "reissue:dent_reissue:nonce",
     })
-    expect(JSON.stringify(deliveries)).not.toContain(rawToken)
-    expect(JSON.stringify(logger.error.mock.calls)).not.toContain(rawToken)
+    expect(delivery.idempotency_key).toBe(
+      "dent_reissue:reissued:c549688c-c14f-4a0a-b4eb-f9a54ea50e26"
+    )
+    expect(JSON.stringify(result)).not.toContain("guest_access_token")
+    expect(JSON.stringify(delivery)).not.toContain("guest_access_token")
+  })
+})
+
+describe("revokeEntitlementWorkflow", () => {
+  it("uses the atomic state-and-outbox service operation", async () => {
+    const service = {
+      revokeEntitlementWithNotification: jest.fn().mockResolvedValue({
+        entitlement: { id: "dent_admin", status: "revoked" },
+        delivery: { id: "dnotif_admin" },
+      }),
+    }
+    const container = createMedusaContainer()
+    container.register({
+      [ContainerRegistrationKeys.LOGGER]: asValue({
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+        debug: jest.fn(),
+      }),
+      [Modules.LOCKING]: asValue({
+        acquire: jest.fn().mockResolvedValue(undefined),
+        release: jest.fn().mockResolvedValue(undefined),
+      }),
+      [Modules.EVENT_BUS]: asValue({
+        emit: jest.fn().mockResolvedValue(undefined),
+        clearGroupedEvents: jest.fn().mockResolvedValue(undefined),
+        releaseGroupedEvents: jest.fn().mockResolvedValue(undefined),
+      }),
+      [DIGITAL_DOWNLOADS_MODULE]: asValue(service),
+    })
+
+    const { result } = await revokeEntitlementWorkflow(container).run({
+      input: {
+        entitlement_id: "dent_admin",
+        reason: "Support revocation",
+        actor: "user_admin",
+        notify: true,
+      },
+      context: { transactionId: "test:single-revoke:atomic" },
+    })
+
+    expect(service.revokeEntitlementWithNotification).toHaveBeenCalledWith({
+      entitlement_id: "dent_admin",
+      reason: "Support revocation",
+      actor: { type: "admin", id: "user_admin" },
+      notify: true,
+    })
+    expect(result).toMatchObject({
+      entitlement: { status: "revoked" },
+      notification_events: [{ delivery_id: "dnotif_admin" }],
+    })
   })
 })

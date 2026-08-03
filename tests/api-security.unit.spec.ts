@@ -393,6 +393,7 @@ describe("ranges, projections, and error privacy", () => {
         req: { requestId: "req_test" },
         status: jest.fn(),
         set: jest.fn(),
+        setHeader: jest.fn(),
         json: jest.fn(),
       }
       res.status.mockReturnValue(res)
@@ -426,6 +427,27 @@ describe("ranges, projections, and error privacy", () => {
       }),
     )
     expect(typed.set).toHaveBeenCalledWith(PRIVATE_NO_STORE_HEADERS)
+
+    const unsatisfiable = response()
+    sendApiError(
+      unsatisfiable,
+      Object.assign(new Error("Byte range is not satisfiable"), {
+        status: 416,
+        code: "range_not_satisfiable",
+        details: { total_size: 123, unsafe: "not projected" },
+      }),
+    )
+    expect(unsatisfiable.status).toHaveBeenCalledWith(416)
+    expect(unsatisfiable.setHeader).toHaveBeenCalledWith(
+      "Content-Range",
+      "bytes */123",
+    )
+    expect(unsatisfiable.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "range_not_satisfiable",
+        details: { total_size: 123 },
+      }),
+    )
   })
 
   it("defines private anti-sniffing headers for all sensitive responses", () => {
@@ -435,7 +457,7 @@ describe("ranges, projections, and error privacy", () => {
       "X-Content-Type-Options": "nosniff",
     })
     expect(CONTENT_SECURITY_HEADERS).toMatchObject({
-      "Cache-Control": "private, no-store, max-age=0",
+      "Cache-Control": "private, no-store, max-age=0, no-transform",
       "Content-Security-Policy": "default-src 'none'; sandbox",
       "X-Content-Type-Options": "nosniff",
     })

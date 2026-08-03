@@ -31,6 +31,7 @@ const DigitalEntitlement = model
     customer_id: model.text().nullable(),
     customer_email: model.text().nullable(),
     customer_name: model.text().nullable(),
+    guest_access_epoch: model.number().default(0),
     unit_index: model.number().default(0),
     quantity: model.number().default(1),
     available_at: model.dateTime().nullable(),
@@ -81,6 +82,8 @@ const DigitalEntitlement = model
   .checks([
     { name: "CK_digital_entitlement_quantity", expression: ({ quantity }) => `${quantity} > 0` },
     { name: "CK_digital_entitlement_unit_index", expression: ({ unit_index }) => `${unit_index} >= 0` },
+    { name: "CK_digital_entitlement_guest_access_epoch", expression: ({ guest_access_epoch }) =>
+      `${guest_access_epoch} >= 0` },
     { name: "CK_digital_entitlement_download_count", expression: ({ download_count }) => `${download_count} >= 0` },
     { name: "CK_digital_entitlement_download_limit", expression: ({ download_limit }) =>
       `(${download_limit} IS NULL OR ${download_limit} >= 0)` },

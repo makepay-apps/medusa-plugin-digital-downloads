@@ -40,7 +40,7 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
       },
     },
   },
-  testSuite: ({ service }) => {
+  testSuite: ({ service, MikroOrmWrapper }) => {
     const rawService = service as any
 
     async function createProduct(
@@ -116,7 +116,7 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
 
     async function createLicenseFixture(
       requireDeviceId = true,
-      customerId = "cus_license",
+      customerId: string | null = "cus_license",
     ) {
       const product = await createProduct(DigitalDeliveryMode.LICENSE)
       const policy = await rawService.createLicensePolicies({
@@ -158,6 +158,707 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
     }
 
     describe("frozen domain regressions", () => {
+      it("rejects a license asset without an enabled generated or pool policy", async () => {
+        const product = await createProduct(DigitalDeliveryMode.LICENSE)
+        const release = await rawService.createDigitalProductReleases({
+          digital_product_id: product.id,
+          version: "1.0.0",
+          status: DigitalReleaseStatus.READY,
+        })
+        const body = Buffer.from(`license-asset:${product.id}`)
+        const storageKey = `regressions/${product.id}/license/${randomUUID()}.txt`
+        const stored = await service.storeAssetObject({
+          key: storageKey,
+          body,
+          mime_type: "text/plain",
+        })
+        await rawService.createDigitalAssets({
+          release_id: release.id,
+          name: "License instructions",
+          role: DigitalAssetRole.LICENSE,
+          kind: DigitalAssetKind.FILE,
+          status: DigitalAssetStatus.READY,
+          delivery_type: DigitalDeliveryMode.LICENSE,
+          storage_provider: DigitalStorageProvider.LOCAL,
+          storage_key: storageKey,
+          storage_bucket: null,
+          original_filename: "license.txt",
+          mime_type: "text/plain",
+          size_bytes: stored.size,
+          checksum_sha256: stored.checksumSha256,
+          is_enabled: true,
+        })
+
+        await expect(
+          service.publishDigitalProductRelease(release.id),
+        ).rejects.toThrow(/ready deliverables for license delivery/)
+      })
+
+      it.each([
+        {
+          initialRole: DigitalAssetRole.DOWNLOAD,
+          initialDeliveryType: DigitalDeliveryMode.DOWNLOAD,
+          targetRole: DigitalAssetRole.STREAM,
+          targetDeliveryType: DigitalDeliveryMode.STREAM,
+          productDeliveryType: DigitalDeliveryMode.STREAM,
+          action: "stream" as const,
+        },
+        {
+          initialRole: DigitalAssetRole.STREAM,
+          initialDeliveryType: DigitalDeliveryMode.STREAM,
+          targetRole: DigitalAssetRole.DOWNLOAD,
+          targetDeliveryType: DigitalDeliveryMode.DOWNLOAD,
+          productDeliveryType: DigitalDeliveryMode.DOWNLOAD,
+          action: "download" as const,
+        },
+      ])(
+        "keeps $targetRole role and delivery authorization aligned through publication",
+        async ({
+          initialRole,
+          initialDeliveryType,
+          targetRole,
+          targetDeliveryType,
+          productDeliveryType,
+          action,
+        }) => {
+          const product = await createProduct(productDeliveryType)
+          const release = await rawService.createDigitalProductReleases({
+            digital_product_id: product.id,
+            version: `role-transition-${randomUUID()}`,
+            status: DigitalReleaseStatus.READY,
+          })
+          const body = Buffer.from(`role-transition:${product.id}:${targetRole}`)
+          const storageKey = `regressions/${product.id}/role/${randomUUID()}.bin`
+          const stored = await service.storeAssetObject({
+            key: storageKey,
+            body,
+            mime_type: "application/octet-stream",
+          })
+          const asset = await rawService.createDigitalAssets({
+            release_id: release.id,
+            name: "Role transition asset",
+            role: initialRole,
+            kind: DigitalAssetKind.FILE,
+            status: DigitalAssetStatus.READY,
+            delivery_type: initialDeliveryType,
+            storage_provider: DigitalStorageProvider.LOCAL,
+            storage_key: storageKey,
+            storage_bucket: null,
+            original_filename: "role-transition.bin",
+            mime_type: "application/octet-stream",
+            size_bytes: stored.size,
+            checksum_sha256: stored.checksumSha256,
+            is_enabled: true,
+          })
+
+          await service.updateDigitalAssets({ id: asset.id, role: targetRole })
+          const updated = await rawService.retrieveDigitalAsset(asset.id)
+          expect(updated).toMatchObject({
+            role: targetRole,
+            delivery_type: targetDeliveryType,
+          })
+
+          const published = await service.publishDigitalProductRelease(release.id)
+          const [entitlement] = await service.issueOrderEntitlements({
+            order_id: `order_role_${randomUUID()}`,
+            customer_id: `cus_role_${randomUUID()}`,
+            customer_email: "role-transition@example.test",
+            items: [
+              {
+                digital_product_id: product.id,
+                release_id: published.id,
+                order_line_item_id: `item_role_${randomUUID()}`,
+              },
+            ],
+          })
+          const issued = await service.createDownloadGrant({
+            entitlement_id: entitlement.id,
+            asset_id: asset.id,
+            action,
+            idempotency_key: `role-grant-${randomUUID()}`,
+          })
+
+          expect(issued.grant).toMatchObject({
+            entitlement_id: entitlement.id,
+            asset_id: asset.id,
+            metadata: expect.objectContaining({ action }),
+          })
+        },
+      )
+
+      it("rolls back guest rotation when the replacement notification cannot be persisted", async () => {
+        const fixture = await createDownloadFixture({ customerId: null })
+        const beforeSessions = await rawService.listEntitlementAccessSessions({
+          entitlement_id: fixture.entitlement.id,
+        })
+        expect(beforeSessions).toEqual([
+          expect.objectContaining({ status: AccessSessionStatus.ACTIVE }),
+        ])
+
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `alter table "notification_delivery" add constraint "CK_test_reissue_outbox_failure" check ("template" <> 'digital-downloads-reissued')`,
+        )
+        try {
+          await expect(
+            service.reissueEntitlement({
+              entitlement_id: fixture.entitlement.id,
+              reason: "Failure injection",
+              rotate_guest_token: true,
+              create_guest_access: false,
+              notify: true,
+            }),
+          ).rejects.toBeDefined()
+        } finally {
+          await manager.execute(
+            `alter table "notification_delivery" drop constraint if exists "CK_test_reissue_outbox_failure"`,
+          )
+        }
+
+        const entitlement = await rawService.retrieveDigitalEntitlement(
+          fixture.entitlement.id,
+        )
+        const afterSessions = await rawService.listEntitlementAccessSessions({
+          entitlement_id: fixture.entitlement.id,
+        })
+        expect(entitlement.metadata?.last_reissue_id).toBeUndefined()
+        expect(afterSessions).toEqual([
+          expect.objectContaining({
+            id: beforeSessions[0].id,
+            status: AccessSessionStatus.ACTIVE,
+          }),
+        ])
+        await expect(
+          rawService.listNotificationDeliveries({
+            entitlement_id: fixture.entitlement.id,
+            template: "digital-downloads-reissued",
+          }),
+        ).resolves.toHaveLength(0)
+      })
+
+      it("keeps a due entitlement active for expiry retry when its outbox write fails", async () => {
+        const fixture = await createDownloadFixture()
+        const dueAt = new Date(Date.now() - 60_000)
+        await rawService.updateDigitalEntitlements({
+          id: fixture.entitlement.id,
+          expires_at: dueAt,
+        })
+
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `alter table "notification_delivery" add constraint "CK_test_expiry_outbox_failure" check ("template" <> 'digital-downloads-expired')`,
+        )
+        try {
+          await expect(
+            service.expireEntitlement(fixture.entitlement.id),
+          ).rejects.toBeDefined()
+        } finally {
+          await manager.execute(
+            `alter table "notification_delivery" drop constraint if exists "CK_test_expiry_outbox_failure"`,
+          )
+        }
+
+        const entitlement = await rawService.retrieveDigitalEntitlement(
+          fixture.entitlement.id,
+        )
+        expect(entitlement).toMatchObject({
+          status: DigitalEntitlementStatus.ACTIVE,
+        })
+        expect(new Date(entitlement.expires_at).getTime()).toBe(dueAt.getTime())
+        expect(entitlement.metadata?.last_expiration_id).toBeUndefined()
+        await expect(
+          rawService.listNotificationDeliveries({
+            entitlement_id: fixture.entitlement.id,
+            template: "digital-downloads-expired",
+          }),
+        ).resolves.toHaveLength(0)
+
+        const retried = await service.expireEntitlement(fixture.entitlement.id)
+        const expiryKey = retried.delivery?.idempotency_key
+        expect(retried).toMatchObject({
+          entitlement: { status: DigitalEntitlementStatus.EXPIRED },
+          delivery: {
+            idempotency_key: expect.stringMatching(
+              new RegExp(`^${fixture.entitlement.id}:expired:[0-9a-f-]{36}$`),
+            ),
+            template: "digital-downloads-expired",
+          },
+        })
+        await expect(
+          rawService.listNotificationDeliveries({
+            idempotency_key: expiryKey,
+          }),
+        ).resolves.toHaveLength(1)
+      })
+
+      it("renews expired access and creates one retryable notice per expiry cycle", async () => {
+        const fixture = await createDownloadFixture()
+        const now = Date.now()
+        const purchasedAt = new Date(now - 2 * 86_400_000)
+        const firstExpiry = new Date(now - 86_400_000)
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `update "digital_entitlement" set "created_at" = '${purchasedAt.toISOString()}', "expires_at" = '${firstExpiry.toISOString()}' where "id" = '${fixture.entitlement.id}'`,
+        )
+
+        const first = await service.expireEntitlement(fixture.entitlement.id)
+        const reissued = await service.reissueEntitlement({
+          entitlement_id: fixture.entitlement.id,
+          notify: false,
+        })
+        expect(reissued.entitlement.status).toBe(DigitalEntitlementStatus.ACTIVE)
+        expect(new Date(reissued.entitlement.expires_at).getTime()).toBeGreaterThan(
+          Date.now() + 86_300_000,
+        )
+
+        await rawService.updateDigitalEntitlements({
+          id: fixture.entitlement.id,
+          expires_at: new Date(Date.now() - 1),
+          metadata: {
+            ...(reissued.entitlement.metadata ?? {}),
+            last_reissued_at: new Date(
+              Date.now() - 86_400_001,
+            ).toISOString(),
+          },
+        })
+        const second = await service.expireEntitlement(fixture.entitlement.id)
+        expect(second.delivery?.idempotency_key).not.toBe(
+          first.delivery?.idempotency_key,
+        )
+        await expect(
+          rawService.listNotificationDeliveries({
+            entitlement_id: fixture.entitlement.id,
+            template: "digital-downloads-expired",
+          }),
+        ).resolves.toHaveLength(2)
+
+        const secondReissue = await service.reissueEntitlement({
+          entitlement_id: fixture.entitlement.id,
+          notify: false,
+        })
+        expect(
+          new Date(secondReissue.entitlement.expires_at).getTime(),
+        ).toBeGreaterThan(Date.now() + 86_300_000)
+      })
+
+      it("persists the exact explicit future deadline when reissuing", async () => {
+        const fixture = await createDownloadFixture()
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `update "digital_entitlement" set "expires_at" = now() - interval '1 day', "metadata" = '{}'::jsonb where "id" = '${fixture.entitlement.id}'`,
+        )
+        const staleScanCutoff = new Date()
+        const replacementExpiry = new Date(Date.now() + 45 * 86_400_000)
+
+        const reissued = await service.reissueEntitlement({
+          entitlement_id: fixture.entitlement.id,
+          expires_at: replacementExpiry.toISOString(),
+          notify: false,
+        })
+
+        expect(reissued.entitlement.status).toBe(
+          DigitalEntitlementStatus.ACTIVE,
+        )
+        expect(new Date(reissued.entitlement.expires_at).getTime()).toBe(
+          replacementExpiry.getTime(),
+        )
+        await expect(
+          rawService.retrieveDigitalEntitlement(fixture.entitlement.id),
+        ).resolves.toMatchObject({
+          expires_at: replacementExpiry,
+        })
+        await expect(
+          service.expireEntitlementIfDue({
+            entitlement_id: fixture.entitlement.id,
+            as_of: staleScanCutoff,
+          }),
+        ).resolves.toMatchObject({
+          entitlement: { status: DigitalEntitlementStatus.ACTIVE },
+          expired: false,
+        })
+      })
+
+      it("reconciles a legacy expired row without a seeded cycle exactly once", async () => {
+        const fixture = await createDownloadFixture()
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `update "digital_entitlement" set "status" = 'expired', "expires_at" = now() - interval '1 day', "metadata" = '{}'::jsonb where "id" = '${fixture.entitlement.id}'`,
+        )
+
+        const before = await service.listLifecycleNotificationRepairCandidates({
+          limit: 10,
+        })
+        expect(before).toContainEqual({
+          id: fixture.entitlement.id,
+          status: DigitalEntitlementStatus.EXPIRED,
+          reason: "Entitlement access period expired",
+        })
+
+        const repairInput = {
+          entitlement_id: fixture.entitlement.id,
+          expected_status: DigitalEntitlementStatus.EXPIRED,
+          reason: "Entitlement access period expired",
+        } as const
+        const [first, concurrentReplay] = await Promise.all([
+          service.repairLifecycleNotification(repairInput),
+          service.repairLifecycleNotification(repairInput),
+        ])
+        expect(first).toMatchObject({
+          repaired: true,
+          entitlement: {
+            id: fixture.entitlement.id,
+            status: DigitalEntitlementStatus.EXPIRED,
+          },
+          delivery: {
+            idempotency_key: expect.stringMatching(
+              new RegExp(`^${fixture.entitlement.id}:expired:[0-9a-f-]{36}$`),
+            ),
+          },
+        })
+        expect(concurrentReplay.delivery?.id).toBe(first.delivery?.id)
+        await expect(
+          service.listLifecycleNotificationRepairCandidates({ limit: 10 }),
+        ).resolves.not.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: fixture.entitlement.id }),
+          ]),
+        )
+
+        const replay = await service.repairLifecycleNotification(repairInput)
+        expect(replay.delivery?.id).toBe(first.delivery?.id)
+        await expect(
+          rawService.listNotificationDeliveries({
+            entitlement_id: fixture.entitlement.id,
+            template: "digital-downloads-expired",
+          }),
+        ).resolves.toHaveLength(1)
+      })
+
+      it("does not let invalid legacy email or reason starve lifecycle repair", async () => {
+        const invalidEmail = await createDownloadFixture()
+        const malformedReason = await createDownloadFixture()
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `update "digital_entitlement" set "status" = 'expired', "customer_email" = ' INVALID ', "metadata" = '{}'::jsonb, "updated_at" = now() - interval '2 days' where "id" = '${invalidEmail.entitlement.id}'`,
+        )
+        await manager.execute(
+          `update "digital_entitlement" set "status" = 'revoked', "revoke_reason" = E'unsafe\\nreason', "metadata" = '{}'::jsonb, "updated_at" = now() - interval '1 day' where "id" = '${malformedReason.entitlement.id}'`,
+        )
+
+        const candidates = await service.listLifecycleNotificationRepairCandidates({
+          limit: 1,
+        })
+        expect(candidates).toEqual([
+          {
+            id: malformedReason.entitlement.id,
+            status: DigitalEntitlementStatus.REVOKED,
+            reason: "Lifecycle notification reconciliation",
+          },
+        ])
+        await expect(
+          service.repairLifecycleNotification({
+            entitlement_id: candidates[0].id,
+            expected_status: candidates[0].status,
+            reason: candidates[0].reason,
+          }),
+        ).resolves.toMatchObject({ repaired: true })
+      })
+
+      it("treats an invalid stored cycle as legacy without requeueing its v1 outbox", async () => {
+        const fixture = await createDownloadFixture()
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `update "digital_entitlement" set "status" = 'expired', "metadata" = jsonb_build_object('last_expiration_id', E'unsafe\\ncycle') where "id" = '${fixture.entitlement.id}'`,
+        )
+        await rawService.createNotificationDeliveries({
+          entitlement_id: fixture.entitlement.id,
+          idempotency_key: `${fixture.entitlement.id}:expired:v1`,
+          channel: "email",
+          template: "digital-downloads-expired",
+          recipient_hash: "legacy-cycle-recipient",
+          state: "sent",
+          attempt_count: 1,
+          max_attempts: 8,
+          payload: {},
+          metadata: {},
+        })
+
+        await expect(
+          service.listLifecycleNotificationRepairCandidates({ limit: 10 }),
+        ).resolves.not.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: fixture.entitlement.id }),
+          ]),
+        )
+        await expect(
+          service.repairLifecycleNotification({
+            entitlement_id: fixture.entitlement.id,
+            expected_status: DigitalEntitlementStatus.EXPIRED,
+            reason: "Entitlement access period expired",
+          }),
+        ).resolves.toMatchObject({
+          delivery: {
+            idempotency_key: `${fixture.entitlement.id}:expired:v1`,
+          },
+          repaired: true,
+        })
+        await expect(
+          rawService.listNotificationDeliveries({
+            entitlement_id: fixture.entitlement.id,
+            template: "digital-downloads-expired",
+          }),
+        ).resolves.toHaveLength(1)
+      })
+
+      it("repairs a missing current-cycle or soft-deleted expiry outbox", async () => {
+        const fixture = await createDownloadFixture()
+        const manager = MikroOrmWrapper.getManager().fork()
+        const currentCycle = randomUUID()
+        await manager.execute(
+          `update "digital_entitlement" set "status" = 'expired', "metadata" = jsonb_build_object('last_expiration_id', '${currentCycle}') where "id" = '${fixture.entitlement.id}'`,
+        )
+        await rawService.createNotificationDeliveries({
+          entitlement_id: fixture.entitlement.id,
+          idempotency_key: `${fixture.entitlement.id}:expired:older-cycle`,
+          channel: "email",
+          template: "digital-downloads-expired",
+          recipient_hash: "older-cycle-recipient",
+          state: "sent",
+          attempt_count: 1,
+          max_attempts: 8,
+          payload: {},
+          metadata: {},
+        })
+
+        await expect(
+          service.listLifecycleNotificationRepairCandidates({ limit: 10 }),
+        ).resolves.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: fixture.entitlement.id }),
+          ]),
+        )
+        const repaired = await service.repairLifecycleNotification({
+          entitlement_id: fixture.entitlement.id,
+          expected_status: DigitalEntitlementStatus.EXPIRED,
+          reason: "Entitlement access period expired",
+        })
+        expect(repaired.delivery?.idempotency_key).toBe(
+          `${fixture.entitlement.id}:expired:${currentCycle}`,
+        )
+
+        await rawService.updateNotificationDeliveries({
+          id: repaired.delivery.id,
+          state: "sent",
+          sent_at: new Date(),
+        })
+        await expect(
+          service.listLifecycleNotificationRepairCandidates({ limit: 10 }),
+        ).resolves.not.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: fixture.entitlement.id }),
+          ]),
+        )
+
+        await manager.execute(
+          `update "notification_delivery" set "deleted_at" = now() where "id" = '${repaired.delivery.id}'`,
+        )
+        await expect(
+          service.listLifecycleNotificationRepairCandidates({ limit: 10 }),
+        ).resolves.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: fixture.entitlement.id }),
+          ]),
+        )
+        const recreated = await service.repairLifecycleNotification({
+          entitlement_id: fixture.entitlement.id,
+          expected_status: DigitalEntitlementStatus.EXPIRED,
+          reason: "Entitlement access period expired",
+        })
+        expect(recreated.delivery?.id).not.toBe(repaired.delivery?.id)
+        expect(recreated.delivery?.idempotency_key).toBe(
+          repaired.delivery?.idempotency_key,
+        )
+        await expect(
+          rawService.listNotificationDeliveries({
+            idempotency_key: repaired.delivery?.idempotency_key,
+          }),
+        ).resolves.toHaveLength(1)
+      })
+
+      it("retries missing legacy revoked and refunded outboxes without duplicates", async () => {
+        const revokedFixture = await createDownloadFixture()
+        const refundedFixture = await createDownloadFixture()
+        await service.revokeEntitlement(
+          revokedFixture.entitlement.id,
+          "Legacy revocation",
+        )
+        await service.revokeEntitlement(
+          refundedFixture.entitlement.id,
+          "Legacy refund",
+        )
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `update "digital_entitlement" set "metadata" = '{}'::jsonb where "id" = '${revokedFixture.entitlement.id}'`,
+        )
+        await manager.execute(
+          `update "digital_entitlement" set "status" = 'refunded', "metadata" = '{}'::jsonb where "id" = '${refundedFixture.entitlement.id}'`,
+        )
+
+        const candidates = await service.listLifecycleNotificationRepairCandidates({
+          limit: 10,
+        })
+        expect(candidates).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              id: revokedFixture.entitlement.id,
+              status: DigitalEntitlementStatus.REVOKED,
+            }),
+            expect.objectContaining({
+              id: refundedFixture.entitlement.id,
+              status: DigitalEntitlementStatus.REFUNDED,
+            }),
+          ]),
+        )
+
+        await manager.execute(
+          `alter table "notification_delivery" add constraint "CK_test_legacy_revocation_repair_failure" check ("template" <> 'digital-downloads-revoked')`,
+        )
+        try {
+          await expect(
+            service.repairLifecycleNotification({
+              entitlement_id: revokedFixture.entitlement.id,
+              expected_status: DigitalEntitlementStatus.REVOKED,
+              reason: "Legacy revocation",
+            }),
+          ).rejects.toBeDefined()
+        } finally {
+          await manager.execute(
+            `alter table "notification_delivery" drop constraint if exists "CK_test_legacy_revocation_repair_failure"`,
+          )
+        }
+        await expect(
+          rawService.retrieveDigitalEntitlement(revokedFixture.entitlement.id),
+        ).resolves.toMatchObject({
+          status: DigitalEntitlementStatus.REVOKED,
+          metadata: expect.not.objectContaining({
+            last_revocation_id: expect.anything(),
+          }),
+        })
+
+        const repaired = []
+        for (const candidate of candidates) {
+          repaired.push(
+            await service.repairLifecycleNotification({
+              entitlement_id: candidate.id,
+              expected_status: candidate.status,
+              reason: candidate.reason,
+            }),
+          )
+        }
+        expect(repaired).toHaveLength(2)
+        expect(repaired.every((result) => result.repaired)).toBe(true)
+        await expect(
+          rawService.retrieveDigitalEntitlement(revokedFixture.entitlement.id),
+        ).resolves.toMatchObject({ status: DigitalEntitlementStatus.REVOKED })
+        await expect(
+          rawService.retrieveDigitalEntitlement(refundedFixture.entitlement.id),
+        ).resolves.toMatchObject({ status: DigitalEntitlementStatus.REFUNDED })
+
+        await expect(
+          service.listLifecycleNotificationRepairCandidates({ limit: 10 }),
+        ).resolves.toHaveLength(0)
+        for (const fixture of [revokedFixture, refundedFixture]) {
+          await expect(
+            rawService.listNotificationDeliveries({
+              entitlement_id: fixture.entitlement.id,
+              template: "digital-downloads-revoked",
+            }),
+          ).resolves.toHaveLength(1)
+        }
+
+        for (const candidate of candidates) {
+          await service.repairLifecycleNotification({
+            entitlement_id: candidate.id,
+            expected_status: candidate.status,
+            reason: candidate.reason,
+          })
+        }
+        for (const fixture of [revokedFixture, refundedFixture]) {
+          await expect(
+            rawService.listNotificationDeliveries({
+              entitlement_id: fixture.entitlement.id,
+              template: "digital-downloads-revoked",
+            }),
+          ).resolves.toHaveLength(1)
+        }
+      })
+
+      it("rolls back an order-wide refund when any revocation outbox insert fails", async () => {
+        const orderId = `order_atomic_${randomUUID()}`
+        const first = await createDownloadFixture({ orderId })
+        const second = await createDownloadFixture({ orderId })
+        const manager = MikroOrmWrapper.getManager().fork()
+        await manager.execute(
+          `alter table "notification_delivery" add constraint "CK_test_order_revoke_outbox_failure" check ("template" <> 'digital-downloads-revoked' or "entitlement_id" <> '${second.entitlement.id}')`,
+        )
+        try {
+          await expect(
+            service.revokeOrderEntitlements({
+              order_id: orderId,
+              reason: "Atomic refund failure injection",
+              trigger: "refund",
+              notify: true,
+            }),
+          ).rejects.toBeDefined()
+        } finally {
+          await manager.execute(
+            `alter table "notification_delivery" drop constraint if exists "CK_test_order_revoke_outbox_failure"`,
+          )
+        }
+
+        for (const fixture of [first, second]) {
+          await expect(
+            rawService.retrieveDigitalEntitlement(fixture.entitlement.id),
+          ).resolves.toMatchObject({ status: DigitalEntitlementStatus.ACTIVE })
+          await expect(
+            rawService.listNotificationDeliveries({
+              entitlement_id: fixture.entitlement.id,
+              template: "digital-downloads-revoked",
+            }),
+          ).resolves.toHaveLength(0)
+        }
+
+        const completed = await service.revokeOrderEntitlements({
+          order_id: orderId,
+          reason: "Atomic refund retry",
+          trigger: "refund",
+          notify: true,
+        })
+        expect(completed.revoked).toHaveLength(2)
+        expect(
+          completed.revoked.every(
+            (entitlement) =>
+              entitlement.status === DigitalEntitlementStatus.REFUNDED,
+          ),
+        ).toBe(true)
+        expect(completed.deliveries).toHaveLength(2)
+
+        await service.revokeOrderEntitlements({
+          order_id: orderId,
+          reason: "Atomic refund retry",
+          trigger: "refund",
+          notify: true,
+        })
+        for (const fixture of [first, second]) {
+          await expect(
+            rawService.listNotificationDeliveries({
+              entitlement_id: fixture.entitlement.id,
+              template: "digital-downloads-revoked",
+            }),
+          ).resolves.toHaveLength(1)
+        }
+      })
+
       it("keeps published and entitlement-pinned release history immutable", async () => {
         const fixture = await createDownloadFixture()
 
@@ -753,6 +1454,465 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
         ).toMatchObject({ activation_count: 1 })
       })
 
+      it("cleans active devices before reusing a revoked assignment for a replacement key", async () => {
+        const fixture = await createLicenseFixture(true)
+        const active = await service.activateLicenseByKey({
+          license_key: fixture.key,
+          instance_id: "previous-active-device",
+        })
+        const blocked = await service.activateLicenseByKey({
+          license_key: fixture.key,
+          instance_id: "previous-blocked-device",
+        })
+        await rawService.updateLicenseActivations({
+          id: blocked.activation.id,
+          status: LicenseActivationStatus.BLOCKED,
+        })
+        await service.revealLicenseKey({
+          assignment_id: fixture.assignment.assignment.id,
+          customer_id: "cus_license",
+        })
+        await rawService.updateLicenseAssignments({
+          id: fixture.assignment.assignment.id,
+          status: LicenseAssignmentStatus.REVOKED,
+          revoked_at: new Date(),
+          revoke_reason: "replace compromised key",
+        })
+
+        const replacementKey = `POOL-${randomUUID()}`.toUpperCase()
+        await service.importLicenseKeys({
+          license_policy_id: fixture.policy.id,
+          keys: [replacementKey],
+        })
+        const replacement = await service.assignLicenseKey({
+          entitlement_id: fixture.entitlement.id,
+          license_policy_id: fixture.policy.id,
+          idempotency_key: `replacement-${randomUUID()}`,
+        })
+
+        expect(replacement).toMatchObject({
+          license_key: replacementKey,
+          assignment: {
+            id: fixture.assignment.assignment.id,
+            status: LicenseAssignmentStatus.ACTIVE,
+            activation_count: 0,
+            revealed_at: null,
+          },
+        })
+        expect(
+          await rawService.retrieveLicenseActivation(active.activation.id),
+        ).toMatchObject({ status: LicenseActivationStatus.DEACTIVATED })
+        expect(
+          await rawService.retrieveLicenseActivation(blocked.activation.id),
+        ).toMatchObject({ status: LicenseActivationStatus.BLOCKED })
+        const [storedReplacement] = await MikroOrmWrapper.getManager()
+          .fork()
+          .execute(
+            'select "license_pool_key_id" from "license_assignment" where "id" = ?',
+            [replacement.assignment.id],
+          )
+        expect(storedReplacement.license_pool_key_id).toBe(
+          replacement.assignment.license_pool_key_id,
+        )
+        await expect(
+          rawService.retrieveLicensePoolKey(
+            storedReplacement.license_pool_key_id,
+          ),
+        ).resolves.toMatchObject({ status: LicensePoolKeyStatus.ASSIGNED })
+        await expect(
+          rawService.listLicenseAssignments({
+            license_pool_key_id: storedReplacement.license_pool_key_id,
+          }),
+        ).resolves.toEqual([
+          expect.objectContaining({ id: replacement.assignment.id }),
+        ])
+        await expect(
+          service.validateLicenseByKey({ license_key: fixture.key }),
+        ).resolves.toMatchObject({ valid: false })
+        await expect(
+          service.activateLicenseByKey({
+            license_key: replacementKey,
+            instance_id: "previous-active-device",
+          }),
+        ).resolves.toMatchObject({
+          activation: { status: LicenseActivationStatus.ACTIVE },
+          assignment: { activation_count: 1 },
+        })
+        await expect(
+          service.activateLicenseByKey({
+            license_key: replacementKey,
+            instance_id: "previous-blocked-device",
+          }),
+        ).rejects.toThrow(/instance is blocked/)
+      })
+
+      it("rotates a past-due active assignment when its entitlement is reissued", async () => {
+        const fixture = await createLicenseFixture(true)
+        const activated = await service.activateLicenseByKey({
+          license_key: fixture.key,
+          instance_id: "past-due-device",
+        })
+        const previousPoolKeyId = fixture.assignment.assignment.license_pool_key_id
+        const past = new Date(Date.now() - 86_400_000)
+        const renewedUntil = new Date(Date.now() + 14 * 86_400_000)
+        await rawService.updateDigitalEntitlements({
+          id: fixture.entitlement.id,
+          status: DigitalEntitlementStatus.EXPIRED,
+          expires_at: past,
+        })
+        await rawService.updateLicenseAssignments({
+          id: fixture.assignment.assignment.id,
+          status: LicenseAssignmentStatus.ACTIVE,
+          expires_at: past,
+        })
+        const replacementKey = `POOL-${randomUUID()}`.toUpperCase()
+        await service.importLicenseKeys({
+          license_policy_id: fixture.policy.id,
+          keys: [replacementKey],
+        })
+
+        const reissued = await service.reissueEntitlement({
+          entitlement_id: fixture.entitlement.id,
+          reason: "renew expired license",
+          expires_at: renewedUntil,
+        })
+        const [stored] = await MikroOrmWrapper.getManager().fork().execute(
+          'select "license_pool_key_id", "status", "activation_count", "revealed_at", "expires_at" from "license_assignment" where "id" = ?',
+          [fixture.assignment.assignment.id],
+        )
+
+        expect(reissued.entitlement).toMatchObject({
+          status: DigitalEntitlementStatus.ACTIVE,
+        })
+        expect(new Date(reissued.entitlement.expires_at).getTime()).toBe(
+          renewedUntil.getTime(),
+        )
+        expect(stored).toMatchObject({
+          status: LicenseAssignmentStatus.ACTIVE,
+          activation_count: 0,
+          revealed_at: null,
+        })
+        expect(stored.license_pool_key_id).not.toBe(previousPoolKeyId)
+        expect(new Date(stored.expires_at).getTime()).toBe(
+          renewedUntil.getTime(),
+        )
+        await expect(
+          rawService.retrieveLicensePoolKey(previousPoolKeyId),
+        ).resolves.toMatchObject({ status: LicensePoolKeyStatus.REVOKED })
+        await expect(
+          rawService.retrieveLicenseActivation(activated.activation.id),
+        ).resolves.toMatchObject({
+          status: LicenseActivationStatus.DEACTIVATED,
+        })
+        await expect(
+          service.activateLicenseByKey({
+            license_key: replacementKey,
+            instance_id: "renewed-device",
+          }),
+        ).resolves.toMatchObject({
+          assignment: { id: fixture.assignment.assignment.id },
+          activation: { status: LicenseActivationStatus.ACTIVE },
+        })
+        await expect(
+          service.validateLicenseByKey({ license_key: fixture.key }),
+        ).resolves.toMatchObject({ valid: false })
+      })
+
+      it("rotates an active assignment on a permitted active reissue", async () => {
+        const fixture = await createLicenseFixture(true)
+        const previousPoolKeyId = fixture.assignment.assignment.license_pool_key_id
+        const replacementKey = `POOL-${randomUUID()}`.toUpperCase()
+        await service.importLicenseKeys({
+          license_policy_id: fixture.policy.id,
+          keys: [replacementKey],
+        })
+
+        await expect(
+          service.reissueEntitlement({
+            entitlement_id: fixture.entitlement.id,
+            reason: "rotate active license",
+            expires_at: null,
+          }),
+        ).resolves.toMatchObject({
+          entitlement: {
+            id: fixture.entitlement.id,
+            status: DigitalEntitlementStatus.ACTIVE,
+            expires_at: null,
+          },
+        })
+        const [stored] = await MikroOrmWrapper.getManager().fork().execute(
+          'select "license_pool_key_id", "status", "expires_at" from "license_assignment" where "id" = ?',
+          [fixture.assignment.assignment.id],
+        )
+        expect(stored).toMatchObject({
+          status: LicenseAssignmentStatus.ACTIVE,
+          expires_at: null,
+        })
+        expect(stored.license_pool_key_id).not.toBe(previousPoolKeyId)
+        await expect(
+          rawService.retrieveLicensePoolKey(previousPoolKeyId),
+        ).resolves.toMatchObject({ status: LicensePoolKeyStatus.REVOKED })
+        await expect(
+          service.activateLicenseByKey({
+            license_key: replacementKey,
+            instance_id: "active-reissue-device",
+          }),
+        ).resolves.toMatchObject({
+          assignment: { id: fixture.assignment.assignment.id },
+        })
+      })
+
+      it("rotates a generated key inside the reissue transaction and rolls a failed rotation back", async () => {
+        const product = await createProduct(DigitalDeliveryMode.LICENSE)
+        const policy = await rawService.createLicensePolicies({
+          digital_product_id: product.id,
+          strategy: LicenseStrategy.GENERATED,
+          activation_limit: 1,
+          require_device_id: true,
+          is_enabled: true,
+        })
+        const release = await rawService.createDigitalProductReleases({
+          digital_product_id: product.id,
+          version: "1.0.0",
+          status: DigitalReleaseStatus.READY,
+        })
+        const published = await service.publishDigitalProductRelease(release.id)
+        const [entitlement] = await service.issueOrderEntitlements({
+          order_id: `order_generated_${randomUUID()}`,
+          customer_id: "cus_generated_reissue",
+          customer_email: "generated-reissue@example.test",
+          items: [
+            {
+              digital_product_id: product.id,
+              release_id: published.id,
+              order_line_item_id: `item_generated_${randomUUID()}`,
+            },
+          ],
+        })
+        const original = await service.assignLicenseKey({
+          entitlement_id: entitlement.id,
+          license_policy_id: policy.id,
+          idempotency_key: `generated-original-${randomUUID()}`,
+        })
+        const originalPoolKeyId = original.assignment.license_pool_key_id
+        const activation = await service.activateLicenseByKey({
+          license_key: original.license_key,
+          instance_id: "generated-original-device",
+        })
+
+        await service.revokeEntitlement(
+          entitlement.id,
+          "rotate generated license",
+        )
+        await expect(
+          service.validateLicenseByKey({
+            license_key: original.license_key,
+            instance_id: "generated-original-device",
+          }),
+        ).resolves.toMatchObject({ valid: false })
+
+        await expect(
+          service.reissueEntitlement({
+            entitlement_id: entitlement.id,
+            reason: "restore with a fresh generated key",
+          }),
+        ).resolves.toMatchObject({
+          entitlement: {
+            id: entitlement.id,
+            status: DigitalEntitlementStatus.ACTIVE,
+          },
+        })
+
+        const replacement = await rawService.retrieveLicenseAssignment(
+          original.assignment.id,
+        )
+        expect(replacement).toMatchObject({
+          status: LicenseAssignmentStatus.ACTIVE,
+          activation_count: 0,
+          revealed_at: null,
+        })
+        expect(replacement.license_pool_key_id).not.toBe(originalPoolKeyId)
+        await expect(
+          rawService.retrieveLicensePoolKey(originalPoolKeyId),
+        ).resolves.toMatchObject({ status: LicensePoolKeyStatus.REVOKED })
+        await expect(
+          rawService.retrieveLicenseActivation(activation.activation.id),
+        ).resolves.toMatchObject({
+          status: LicenseActivationStatus.DEACTIVATED,
+        })
+
+        const revealed = await service.revealLicenseKey({
+          assignment_id: replacement.id,
+          customer_id: "cus_generated_reissue",
+        })
+        expect(revealed.license_key).not.toBe(original.license_key)
+        const replacementActivation = await service.activateLicenseByKey({
+          license_key: revealed.license_key,
+          instance_id: "generated-replacement-device",
+        })
+        expect(replacementActivation).toMatchObject({
+          assignment: { id: replacement.id },
+          activation: { status: LicenseActivationStatus.ACTIVE },
+        })
+
+        await service.revokeEntitlement(
+          entitlement.id,
+          "prepare generated rollback proof",
+        )
+        const observer = MikroOrmWrapper.getManager().fork()
+        const [beforeEntitlement] = await observer.execute(
+          'select "status", "download_count", "guest_access_epoch", "revoked_at", "revoke_reason", "metadata" from "digital_entitlement" where "id" = ?',
+          [entitlement.id],
+        )
+        const [beforeAssignment] = await observer.execute(
+          'select "license_pool_key_id", "status", "activation_count", "revealed_at", "revoked_at", "revoke_reason" from "license_assignment" where "id" = ?',
+          [replacement.id],
+        )
+        const [beforePoolKey] = await observer.execute(
+          'select "status", "assigned_at", "revoked_at" from "license_pool_key" where "id" = ?',
+          [replacement.license_pool_key_id],
+        )
+        const [beforeActivation] = await observer.execute(
+          'select "status", "deactivated_at", "last_seen_at" from "license_activation" where "id" = ?',
+          [replacementActivation.activation.id],
+        )
+        const [beforeKeyCount] = await observer.execute(
+          'select count(*)::integer as "count" from "license_pool_key" where "license_policy_id" = ? and "deleted_at" is null',
+          [policy.id],
+        )
+
+        await observer.execute(
+          'alter table "license_audit_event" add constraint "CK_test_generated_reissue_post_flush_failure" check ("action" <> \'key_assigned\') not valid',
+        )
+        try {
+          await expect(
+            service.reissueEntitlement({
+              entitlement_id: entitlement.id,
+              reason: "force rollback after generated key flush",
+            }),
+          ).rejects.toThrow()
+        } finally {
+          await observer.execute(
+            'alter table "license_audit_event" drop constraint if exists "CK_test_generated_reissue_post_flush_failure"',
+          )
+        }
+
+        const verifier = MikroOrmWrapper.getManager().fork()
+        const [afterEntitlement] = await verifier.execute(
+          'select "status", "download_count", "guest_access_epoch", "revoked_at", "revoke_reason", "metadata" from "digital_entitlement" where "id" = ?',
+          [entitlement.id],
+        )
+        const [afterAssignment] = await verifier.execute(
+          'select "license_pool_key_id", "status", "activation_count", "revealed_at", "revoked_at", "revoke_reason" from "license_assignment" where "id" = ?',
+          [replacement.id],
+        )
+        const [afterPoolKey] = await verifier.execute(
+          'select "status", "assigned_at", "revoked_at" from "license_pool_key" where "id" = ?',
+          [replacement.license_pool_key_id],
+        )
+        const [afterActivation] = await verifier.execute(
+          'select "status", "deactivated_at", "last_seen_at" from "license_activation" where "id" = ?',
+          [replacementActivation.activation.id],
+        )
+        const [afterKeyCount] = await verifier.execute(
+          'select count(*)::integer as "count" from "license_pool_key" where "license_policy_id" = ? and "deleted_at" is null',
+          [policy.id],
+        )
+
+        expect(afterEntitlement).toEqual(beforeEntitlement)
+        expect(afterAssignment).toEqual(beforeAssignment)
+        expect(afterPoolKey).toEqual(beforePoolKey)
+        expect(afterActivation).toEqual(beforeActivation)
+        expect(afterKeyCount).toEqual(beforeKeyCount)
+      })
+
+      it("serializes activation behind revocation before querying device state", async () => {
+        const fixture = await createLicenseFixture(true)
+        const existing = await service.activateLicenseByKey({
+          license_key: fixture.key,
+          instance_id: "existing-device",
+        })
+        const blockerManager = MikroOrmWrapper.getManager().fork()
+        const observer = MikroOrmWrapper.getManager().fork()
+        let releaseBlocker!: () => void
+        const blockerRelease = new Promise<void>((resolve) => {
+          releaseBlocker = resolve
+        })
+        let reportBlocker!: (pid: number) => void
+        const blockerReady = new Promise<number>((resolve) => {
+          reportBlocker = resolve
+        })
+        const blocker = blockerManager.transactional(async (transaction) => {
+          const [backend] = await transaction.execute(
+            "select pg_backend_pid() as pid",
+          )
+          await transaction.execute(
+            'select "id" from "license_activation" where "id" = ? for update',
+            [existing.activation.id],
+          )
+          reportBlocker(Number(backend.pid))
+          await blockerRelease
+        })
+        const blockerPid = await blockerReady
+        const waitForBlockedPid = async (blockingPid: number) => {
+          const deadline = Date.now() + 10_000
+          while (Date.now() < deadline) {
+            const blocked = await observer.execute(
+              'select "pid" from "pg_stat_activity" where cast(? as integer) = any(pg_blocking_pids("pid")) order by "pid"',
+              [blockingPid],
+            )
+            if (blocked.length) return Number(blocked[0].pid)
+            await new Promise((resolve) => setTimeout(resolve, 10))
+          }
+          throw new Error(`No transaction blocked behind backend ${blockingPid}`)
+        }
+
+        const revocation = service.revokeEntitlement(
+          fixture.entitlement.id,
+          "concurrent refund",
+        )
+        const revokePid = await waitForBlockedPid(blockerPid)
+        const activation = service.activateLicenseByKey({
+          license_key: fixture.key,
+          instance_id: "racing-device",
+        })
+        const activationOutcome = activation.then(
+          (value) => ({ status: "fulfilled" as const, value }),
+          (reason) => ({ status: "rejected" as const, reason }),
+        )
+        let serializationState: "blocked" | "settled"
+        try {
+          serializationState = await Promise.race([
+            waitForBlockedPid(revokePid).then(() => "blocked" as const),
+            activationOutcome.then(() => "settled" as const),
+          ])
+        } finally {
+          releaseBlocker()
+        }
+
+        await blocker
+        await expect(revocation).resolves.toMatchObject({
+          status: DigitalEntitlementStatus.REVOKED,
+        })
+        const activationResult = await activationOutcome
+        expect(serializationState).toBe("blocked")
+        expect(activationResult.status).toBe("rejected")
+        expect(
+          await rawService.retrieveLicenseAssignment(
+            fixture.assignment.assignment.id,
+          ),
+        ).toMatchObject({
+          status: LicenseAssignmentStatus.REVOKED,
+          activation_count: 0,
+        })
+        await expect(
+          rawService.listLicenseActivations({
+            assignment_id: fixture.assignment.assignment.id,
+            status: LicenseActivationStatus.ACTIVE,
+          }),
+        ).resolves.toHaveLength(0)
+      }, 30_000)
+
       it("hides unknown and foreign license assignments before exposing owned lifecycle state", async () => {
         const owned = await createLicenseFixture(true, "cus_reveal_owner")
         const foreign = await createLicenseFixture(true, "cus_reveal_foreign")
@@ -801,6 +1961,73 @@ moduleIntegrationTestRunner<DigitalDownloadsModuleService>({
           message: "License assignment is not active",
         })
       })
+
+      it("rejects crossed guest license reveals before acquiring either target graph", async () => {
+        const first = await createLicenseFixture(true, null)
+        const second = await createLicenseFixture(true, null)
+        const firstToken = first.entitlement.guest_access.token as string
+        const secondToken = second.entitlement.guest_access.token as string
+        const originalLock = rawService.lockLicenseAssignmentGraph_.bind(
+          rawService,
+        )
+        let lockArrivals = 0
+        let releaseBoth!: () => void
+        const bothLocked = new Promise<void>((resolve) => {
+          releaseBoth = resolve
+        })
+        rawService.lockLicenseAssignmentGraph_ = async (...args: any[]) => {
+          const graph = await originalLock(...args)
+          lockArrivals += 1
+          if (lockArrivals === 2) releaseBoth()
+          await Promise.race([
+            bothLocked,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("crossed reveal lock barrier timed out")),
+                5_000,
+              ),
+            ),
+          ])
+          return graph
+        }
+
+        let outcomes: PromiseSettledResult<any>[]
+        try {
+          outcomes = await Promise.allSettled([
+            service.revealLicenseKey({
+              assignment_id: first.assignment.assignment.id,
+              guest_token: secondToken,
+              guest_email: "license@example.test",
+            }),
+            service.revealLicenseKey({
+              assignment_id: second.assignment.assignment.id,
+              guest_token: firstToken,
+              guest_email: "license@example.test",
+            }),
+          ])
+        } finally {
+          rawService.lockLicenseAssignmentGraph_ = originalLock
+          releaseBoth()
+        }
+
+        expect(lockArrivals).toBe(0)
+        expect(outcomes).toEqual([
+          expect.objectContaining({
+            status: "rejected",
+            reason: expect.objectContaining({
+              type: "not_found",
+              message: "License assignment was not found",
+            }),
+          }),
+          expect.objectContaining({
+            status: "rejected",
+            reason: expect.objectContaining({
+              type: "not_found",
+              message: "License assignment was not found",
+            }),
+          }),
+        ])
+      }, 30_000)
 
       it("makes pool duplicate reject atomic and skip deterministic under concurrency", async () => {
         const product = await createProduct(DigitalDeliveryMode.LICENSE)

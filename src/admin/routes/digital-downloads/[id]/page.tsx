@@ -30,11 +30,14 @@ import { DigitalStatusBadge } from "../../../components/status-badge"
 import { UploadPanel } from "../../../components/upload-panel"
 import { formatBytes, formatDate, getErrorMessage, humanize } from "../../../lib/format"
 import { digitalDownloadKeys } from "../../../lib/query-keys"
+import { hasPublishableReleaseDeliverables } from "../../../lib/release-readiness"
 import { digitalDownloadsApi } from "../../../lib/sdk"
 import type {
+  DeliveryType,
   DigitalRelease,
   EntitlementFilters,
   EntitlementStatus,
+  LicensePolicy,
 } from "../../../types/digital-downloads"
 
 const ENTITLEMENT_PAGE_SIZE = 10
@@ -101,7 +104,15 @@ const DigitalDownloadDetailPage = () => {
     onError: (error) => toast.error(getErrorMessage(error)),
   })
   const publishMutation = useMutation({
-    mutationFn: (releaseId: string) => digitalDownloadsApi.publishRelease(releaseId),
+    mutationFn: async (releaseId: string) => {
+      const release = configQuery.data?.releases?.find(
+        (candidate) => candidate.id === releaseId
+      )
+      if (release?.status === "draft") {
+        await digitalDownloadsApi.updateRelease(releaseId, { status: "ready" })
+      }
+      return digitalDownloadsApi.publishRelease(releaseId)
+    },
     onSuccess: async () => {
       toast.success("Release published. New entitlements will use it immediately.")
       await invalidateDetail()
@@ -280,7 +291,11 @@ const DigitalDownloadDetailPage = () => {
             </div>
             {!releases.length ? (
               <EmptyState
-                description="Create a draft release below, upload one or more files, then publish it."
+                description={
+                  config.delivery_type === "license"
+                    ? "Create a release below, configure an enabled generated or pool license policy, then publish it."
+                    : "Create a draft release below, upload one or more files, then publish it."
+                }
                 title="No releases yet"
               />
             ) : (
@@ -300,6 +315,8 @@ const DigitalDownloadDetailPage = () => {
                       }
                     }}
                     onPublish={() => publishMutation.mutate(release.id)}
+                    deliveryType={config.delivery_type}
+                    licensePolicy={config.license_policy}
                     release={release}
                   />
                 ))}
@@ -549,6 +566,8 @@ const DigitalDownloadDetailPage = () => {
 
 interface ReleaseRowProps {
   release: DigitalRelease
+  deliveryType: DeliveryType
+  licensePolicy?: LicensePolicy | null
   isPublishing: boolean
   deletingAssetId?: string
   onPublish: () => void
@@ -557,11 +576,22 @@ interface ReleaseRowProps {
 
 const ReleaseRow = ({
   release,
+  deliveryType,
+  licensePolicy,
   isPublishing,
   deletingAssetId,
   onPublish,
   onDeleteAsset,
-}: ReleaseRowProps) => (
+}: ReleaseRowProps) => {
+  const hasDeliverables = hasPublishableReleaseDeliverables({
+    deliveryType,
+    licensePolicy,
+    release,
+  })
+  const licenseOnlyWithoutFiles =
+    deliveryType === "license" && !(release.assets?.length ?? 0)
+
+  return (
   <div className="px-6 py-4">
     <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
       <div>
@@ -578,9 +608,9 @@ const ReleaseRow = ({
           {release.release_notes || "No release notes"} · Created {formatDate(release.created_at)}
         </Text>
       </div>
-      {release.status === "draft" ? (
+      {["draft", "ready"].includes(release.status) ? (
         <Button
-          disabled={!release.assets?.length}
+          disabled={!hasDeliverables}
           isLoading={isPublishing}
           onClick={onPublish}
           size="small"
@@ -642,10 +672,13 @@ const ReleaseRow = ({
       </Table>
     ) : (
       <Text className="mt-3 text-ui-fg-muted" size="small">
-        No files uploaded.
+        {licenseOnlyWithoutFiles && hasDeliverables
+          ? "No files required; this release uses the enabled license policy."
+          : "No files uploaded."}
       </Text>
     )}
   </div>
-)
+  )
+}
 
 export default DigitalDownloadDetailPage

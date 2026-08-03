@@ -1,8 +1,10 @@
+import { Readable } from "node:stream"
+
 import { DigitalDownloadsModuleService } from ".."
 
 type LockObserver = (table: string, ids: string[]) => void | Promise<void>
 
-function serviceHarness() {
+function serviceHarness(allowedMimeTypes: string[] = []) {
   const events: string[] = []
   const releases = new Map<string, Record<string, any>>([
     [
@@ -33,6 +35,9 @@ function serviceHarness() {
         id: "dasset_1",
         release_id: "drel_old",
         name: "Original asset",
+        role: "download",
+        delivery_type: "download",
+        mime_type: "application/pdf",
       },
     ],
   ])
@@ -89,7 +94,7 @@ function serviceHarness() {
   }
   const service = new DigitalDownloadsModuleService({
     baseRepository,
-    digitalDownloadsOptions: {},
+    digitalDownloadsOptions: { allowedMimeTypes },
     digitalDownloadsStorage: {},
     digitalAssetService: {
       create: generated.assetCreate,
@@ -287,6 +292,123 @@ describe("transactional publication immutability wrappers", () => {
     expect(harness.generated.assetUpdate).not.toHaveBeenCalled()
   })
 
+  it.each([
+    { role: "stream", deliveryType: "stream" },
+    { role: "download", deliveryType: "download" },
+    { role: "preview", deliveryType: "download" },
+    { role: "cover", deliveryType: "download" },
+    { role: "manual", deliveryType: "download" },
+    { role: "license", deliveryType: "license" },
+  ])(
+    "updates delivery_type atomically when an asset role changes to $role",
+    async ({ role, deliveryType }) => {
+      const harness = serviceHarness()
+
+      await harness.service.updateDigitalAssets({ id: "dasset_1", role })
+
+      expect(harness.generated.assetUpdate).toHaveBeenCalledWith(
+        {
+          id: "dasset_1",
+          role,
+          delivery_type: deliveryType,
+        },
+        expect.objectContaining({
+          transactionManager: harness.transactionManager,
+        }),
+      )
+    },
+  )
+
+  it("normalizes a created stream role and rejects incompatible explicit asset delivery", async () => {
+    const harness = serviceHarness()
+
+    await harness.service.createDigitalAssets({
+      release_id: "drel_old",
+      name: "Stream asset",
+      role: "stream",
+    })
+    expect(harness.generated.assetCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: "stream",
+        delivery_type: "stream",
+      }),
+      expect.objectContaining({
+        transactionManager: harness.transactionManager,
+      }),
+    )
+
+    await expect(
+      harness.service.createDigitalAssets({
+        release_id: "drel_old",
+        name: "Invalid stream asset",
+        role: "stream",
+        delivery_type: "download",
+      }),
+    ).rejects.toThrow(/incompatible/)
+  })
+
+  it("reapplies the configured MIME policy to the effective asset MIME on update", async () => {
+    const harness = serviceHarness(["application/pdf"])
+
+    await harness.service.updateDigitalAssets({
+      id: "dasset_1",
+      name: "Allowed PDF asset",
+    })
+    expect(harness.generated.assetUpdate).toHaveBeenCalledTimes(1)
+
+    harness.generated.assetUpdate.mockClear()
+    await expect(
+      harness.service.updateDigitalAssets({
+        id: "dasset_1",
+        mime_type: "text/html",
+      }),
+    ).rejects.toThrow(/MIME type text\/html is not allowed/)
+    expect(harness.generated.assetUpdate).not.toHaveBeenCalled()
+    expect(harness.assets.get("dasset_1")!.mime_type).toBe("application/pdf")
+
+    await harness.service.updateDigitalAssets({
+      id: "dasset_1",
+      name: "Allowed explicit PDF asset",
+      mime_type: "application/pdf",
+    })
+    expect(harness.generated.assetUpdate).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects a disallowed explicit MIME before creating an asset", async () => {
+    const harness = serviceHarness(["application/pdf"])
+
+    await expect(
+      harness.service.createDigitalAssets({
+        release_id: "drel_old",
+        name: "HTML asset",
+        mime_type: "text/html",
+      }),
+    ).rejects.toThrow(/MIME type text\/html is not allowed/)
+    expect(harness.generated.assetCreate).not.toHaveBeenCalled()
+  })
+
+  it("reports immutable-release conflicts before MIME-policy errors", async () => {
+    const harness = serviceHarness(["application/pdf"])
+    harness.releases.get("drel_old")!.status = "published"
+
+    await expect(
+      harness.service.updateDigitalAssets({
+        id: "dasset_1",
+        mime_type: "text/html",
+      }),
+    ).rejects.toThrow(/immutable/)
+    expect(harness.generated.assetUpdate).not.toHaveBeenCalled()
+
+    await expect(
+      harness.service.createDigitalAssets({
+        release_id: "drel_old",
+        name: "HTML asset",
+        mime_type: "text/html",
+      }),
+    ).rejects.toThrow(/immutable/)
+    expect(harness.generated.assetCreate).not.toHaveBeenCalled()
+  })
+
   it("rechecks the owning release after asset and release locks before deleting", async () => {
     const harness = serviceHarness()
     harness.onLock((table) => {
@@ -342,5 +464,85 @@ describe("transactional publication immutability wrappers", () => {
     expect(releaseLock).toBeGreaterThan(0)
     expect(releaseLock).toBeLessThan(releaseRead)
     expect(harness.generated[entry.generated]).not.toHaveBeenCalled()
+  })
+
+  it("fails public previews closed when product preview policy or ownership changes", async () => {
+    const harness = serviceHarness()
+    const bytes = Buffer.from("preview")
+    harness.assets.set("dasset_preview", {
+      id: "dasset_preview",
+      release_id: "drel_old",
+      role: "preview",
+      status: "ready",
+      is_enabled: true,
+      storage_provider: "local",
+      storage_key: "previews/preview.txt",
+      storage_bucket: null,
+      original_filename: "preview.txt",
+      mime_type: "text/plain",
+      size_bytes: bytes.byteLength,
+    })
+    harness.releases.set("drel_old", {
+      id: "drel_old",
+      digital_product_id: "dprod_1",
+      status: "published",
+      is_current: true,
+      published_at: new Date(),
+      metadata: {},
+    })
+    const product = {
+      id: "dprod_1",
+      status: "active",
+      metadata: {
+        preview_enabled: true,
+        active_release_id: "drel_old",
+      },
+    }
+    harness.service.retrieveDigitalProduct.mockImplementation(async () => ({
+      ...product,
+      metadata: { ...product.metadata },
+    }))
+    const get = jest.fn(async () => ({
+      body: Readable.from([bytes]),
+      size: bytes.byteLength,
+      totalSize: bytes.byteLength,
+      contentType: "text/plain",
+      etag: 'W/"preview"',
+      statusCode: 200,
+      contentRange: undefined,
+    }))
+    harness.service.storage_ = { get }
+
+    const opened = await harness.service.openDigitalAsset("dasset_preview", {
+      purpose: "preview",
+    })
+    opened.body.destroy()
+    expect(get).toHaveBeenCalledTimes(1)
+
+    product.metadata.preview_enabled = false
+    await expect(
+      harness.service.openDigitalAsset("dasset_preview", {
+        purpose: "preview",
+      }),
+    ).rejects.toMatchObject({ type: "not_found" })
+    expect(get).toHaveBeenCalledTimes(1)
+
+    product.metadata.preview_enabled = true
+    product.metadata.active_release_id = "drel_other"
+    await expect(
+      harness.service.openDigitalAsset("dasset_preview", {
+        purpose: "preview",
+      }),
+    ).rejects.toMatchObject({ type: "not_found" })
+    expect(get).toHaveBeenCalledTimes(1)
+
+    product.metadata.active_release_id = "drel_old"
+    product.id = "dprod_other"
+    await expect(
+      harness.service.openDigitalAsset("dasset_preview", {
+        purpose: "preview",
+      }),
+    ).rejects.toMatchObject({ type: "not_found" })
+    expect(get).toHaveBeenCalledTimes(1)
   })
 })

@@ -18,6 +18,7 @@ describe("digital-download module options", () => {
       defaultDownloadLimit: 5,
       defaultGrantTtlSeconds: 900,
       maxGrantTtlSeconds: 86_400,
+      guestAccessTtlSeconds: 2_592_000,
       maxUploadSizeBytes: 5 * 1024 * 1024 * 1024,
       allowedMimeTypes: [],
       allowGuestAccess: true,
@@ -25,6 +26,25 @@ describe("digital-download module options", () => {
     })
     expect(path.isAbsolute(options.storage.local.rootPath)).toBe(true)
     expect(options.storage.local.signingSecret).toBe("")
+  })
+
+  it("preserves explicit runtime policy ceilings for service reconciliation", () => {
+    const options = resolveDigitalDownloadsOptions(
+      {
+        defaultGrantTtlSeconds: 60,
+        maxGrantTtlSeconds: 120,
+        maxUploadSizeBytes: 1_024,
+        allowGuestAccess: false,
+      },
+      {},
+    )
+
+    expect(options).toMatchObject({
+      defaultGrantTtlSeconds: 60,
+      maxGrantTtlSeconds: 120,
+      maxUploadSizeBytes: 1_024,
+      allowGuestAccess: false,
+    })
   })
 
   it("normalizes MIME policy and reads secrets from explicit environment input", () => {
@@ -58,6 +78,12 @@ describe("digital-download module options", () => {
         {},
       ),
     ).toThrow("maxGrantTtlSeconds must be an integer between 900")
+    expect(() =>
+      resolveDigitalDownloadsOptions({ guestAccessTtlSeconds: 86_399 }, {}),
+    ).toThrow("guestAccessTtlSeconds must be an integer between 86400")
+    expect(() =>
+      resolveDigitalDownloadsOptions({ guestAccessTtlSeconds: 31_536_001 }, {}),
+    ).toThrow("guestAccessTtlSeconds must be an integer between 86400")
     expect(() =>
       resolveDigitalDownloadsOptions({ defaultDownloadLimit: -1 }, {}),
     ).toThrow("defaultDownloadLimit must be an integer between 0")

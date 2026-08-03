@@ -308,6 +308,20 @@ describe("protected local storage", () => {
     ).rejects.toThrow(/Storage key/)
   })
 
+  it("bounds storage path segments by UTF-8 bytes", async () => {
+    const oversizedMultibyteSegment = "é".repeat(128)
+    expect(oversizedMultibyteSegment).toHaveLength(128)
+    expect(Buffer.byteLength(oversizedMultibyteSegment, "utf8")).toBe(256)
+
+    await expect(
+      driver.put({
+        key: `assets/${oversizedMultibyteSegment}`,
+        body: Buffer.from("payload"),
+        contentType: "application/octet-stream",
+      }),
+    ).rejects.toThrow("oversized path segment")
+  })
+
   it("refuses parent and final symlinks that escape the configured root", async () => {
     await symlink(outside, path.join(root, "linked-parent"))
     await expect(

@@ -173,7 +173,10 @@ A protected master asset does not become public because a caller knows its ID.
 
 `GET /store/digital-downloads/previews/:asset_id` returns bytes rather than a
 JSON envelope. It supports standard media response headers and a single byte
-range. Non-preview, retired, or unavailable assets return not found.
+range. Non-preview, retired, or unavailable assets return not found. The same
+fail-closed response is used when the owning product configuration has
+`preview_enabled: false` or no longer points at the asset's published current
+release.
 
 ### Customer library
 
@@ -279,8 +282,11 @@ Range: bytes=0-1048575
 
 The route accepts either no `Range` or one `bytes=` range and returns `200` or
 `206` with `Accept-Ranges`, `Content-Length`, and, for partial responses,
-`Content-Range`. Multiple ranges are rejected. The response is `private,
-no-store` and includes defensive content headers. Before it sets response
+`Content-Range`. An unsatisfiable range returns `416` with
+`Content-Range: bytes */<asset-size>`, and multiple ranges are rejected. The
+response is `private, no-store, no-transform` so Medusa or intermediary
+compression cannot invalidate byte offsets or lengths. It also includes
+defensive content headers. Before it sets response
 headers or writes the first body byte, the delivery pipeline atomically commits
 one grant use and one logical entitlement download. An accounting failure
 therefore returns an error without exposing protected bytes. After the commit,
@@ -296,8 +302,10 @@ Both local-file and S3 delivery use this same-origin protected proxy; S3
 presigned URLs are upload-only. The opened body is a Node `Readable` piped to
 the response with backpressure, not a whole-object buffer. Local reads keep the
 validated no-follow file handle open; S3 reads validate the provider's length
-and range metadata and sanitize late stream errors. The route has no `HEAD`
-operation in version 1.
+and range metadata and sanitize late stream errors. The handler explicitly
+rejects `HEAD` before grant redemption because Express otherwise treats a `GET`
+route as an implicit `HEAD` route. Version 1 exposes protected content as `GET`
+only.
 
 ### Guest access
 
@@ -338,6 +346,12 @@ invalid capability. Prompt the buyer for the email—do not embed it in the magi
 link. Keep the guest capability in memory or in an encrypted, HttpOnly
 server-side session. The plugin rejects content grant tokens supplied in query
 strings.
+
+The guest purchase capability and an asset content grant have independent
+lifetimes. `guest_access_ttl_seconds` defaults to 2,592,000 seconds (30 days)
+and is bounded from 86,400 through 31,536,000 seconds. A successful guest access
+exchange does not create a permanent file URL; the caller must still request a
+short-lived, asset-bound grant.
 
 ### License lifecycle
 
@@ -417,7 +431,7 @@ are never returned.
 `PATCH` accepts only persisted behavioral settings: `enabled`,
 `default_delivery_type`, `default_download_limit`,
 `default_grant_ttl_seconds`, `max_grant_ttl_seconds`,
-`max_upload_size_bytes`, `allow_guest_access`,
+`guest_access_ttl_seconds`, `max_upload_size_bytes`, `allow_guest_access`,
 `require_order_email_match`, `event_retention_days`, and `metadata`. The stable
 Admin aliases `download_limit_default`, `grant_ttl_seconds`,
 `signed_url_ttl_seconds`, `max_upload_bytes`, `max_upload_size_mb`, and
@@ -430,6 +444,12 @@ options and cannot be changed by this endpoint. See
 guest grant, and guest license-reveal requests must include the order email;
 missing and mismatched values fail with the same unauthorized envelope as an
 invalid guest capability.
+
+`guest_access_ttl_seconds` defaults to 2,592,000 seconds (30 days), is bounded
+from 1 through 365 days, and applies to newly issued guest purchase-access
+capabilities. The effective ceiling is the lower of this setting and the
+resolved `guestAccessTtlSeconds` module option; an explicit session TTL cannot
+exceed it. It does not change the content-grant TTL fields.
 
 The storage health operation returns `ready`, `provider`, `issues`, and
 `operation` inside `storage_test`. `write_read_delete` additionally returns
@@ -453,6 +473,7 @@ Create body:
   "product_id": "prod_01...",
   "variant_ids": ["variant_01..."],
   "title": "Album digital delivery",
+  "handle": "album-digital-delivery",
   "description": "MP3 and FLAC release",
   "status": "draft",
   "delivery_type": "download",
@@ -467,6 +488,8 @@ Create body:
 
 `delivery_type` is `download`, `stream`, `license`, or `mixed`.
 `fulfillment_strategy` is `payment_captured`, `order_completed`, or `manual`.
+`handle` is optional; when omitted it is derived from `title`. Supply a stable,
+unique handle for repeatable imports that reuse a customer-facing title.
 Patch accepts a non-empty subset of the create fields.
 
 ### Releases, assets, and uploads
@@ -478,7 +501,7 @@ Patch accepts a non-empty subset of the create fields.
 | `GET` | `/admin/digital-downloads/releases/:id` | `{ release }` with safe asset relations. |
 | `PATCH` | `/admin/digital-downloads/releases/:id` | Patch mutable release fields. |
 | `DELETE` | `/admin/digital-downloads/releases/:id` | Delete a permitted draft release. |
-| `POST` | `/admin/digital-downloads/releases/:id/publish` | `{ make_active?, notify_existing_customers? }`; returns `{ release }`. |
+| `POST` | `/admin/digital-downloads/releases/:id/publish` | `{ make_active?, notify_existing_customers? }`; `notify_existing_customers: true` is rejected until update-policy semantics are supported. Returns `{ release }`. |
 | `GET` | `/admin/digital-downloads/assets` | Filters: `release_id`, `product_config_id`, `role`, `status`, `mime_type`, pagination. |
 | `GET` | `/admin/digital-downloads/assets/:id` | `{ asset }`, with storage secrets omitted. |
 | `PATCH` | `/admin/digital-downloads/assets/:id` | Patch mutable display/classification fields. |
@@ -490,6 +513,15 @@ Patch accepts a non-empty subset of the create fields.
 A release create body includes `product_config_id`, `version`, `title`, and
 optional `notes`, `status`, `asset_ids`, `publish_at`, and `metadata`.
 Publication is a domain transition, not an ordinary status patch.
+
+All delivery modes require a published release before entitlement issuance.
+Publication requires ready download/manual assets for `download`, ready stream
+assets for `stream`, and ready content plus an enabled generated/pooled license
+policy for `mixed`. A `license` product still requires the immutable published
+release boundary, but that release may contain zero assets when an enabled
+generated or pooled policy supplies its license deliverable. Existing
+entitlements remain pinned to the purchased release; callers must omit
+`notify_existing_customers` or send `false`.
 
 Asset roles are `download`, `stream`, `preview`, `cover`, `manual`, and
 `license`. The `preview` and `cover` roles are public; every other role is
@@ -563,7 +595,7 @@ and destroy staging copies after verifying the import result.
 | `GET` | `/admin/digital-downloads/entitlements` | Filters include order, line item, customer, product/config/variant, status, and pagination. |
 | `GET` | `/admin/digital-downloads/entitlements/:id` | `{ entitlement }` using an Admin-safe projection. |
 | `POST` | `/admin/digital-downloads/entitlements/:id/revoke` | `{ reason, notify? }`; returns `{ entitlement }`. |
-| `POST` | `/admin/digital-downloads/entitlements/:id/reissue` | `{ reason?, notify?, reset_downloads?, rotate_guest_token? }`; returns `{ entitlement }`. |
+| `POST` | `/admin/digital-downloads/entitlements/:id/reissue` | `{ reason?, notify?, reset_downloads?, rotate_guest_token?, expires_at? }`; returns `{ entitlement }`. |
 | `POST` | `/admin/digital-downloads/orders/:order_id/issue` | Reconcile/issue one Medusa order; returns `202 { operation }`. |
 | `GET` | `/admin/digital-downloads/downloads` | Filters: entitlement, asset, customer, status, `from`, `to`, pagination. |
 | `GET` | `/admin/digital-downloads/audit-events` | Filters: entity type/ID, action, actor, `from`, `to`, pagination. |
@@ -573,11 +605,18 @@ grants/sessions and can trigger a notification. Reissue can rotate guest access 
 optionally reset logical download counters. Neither route should be emulated by
 editing entitlement rows directly.
 
+When `expires_at` is omitted, reissuing a past-due entitlement renews the
+original recorded purchase term from the reissue time. Supply a future ISO
+timestamp to choose a replacement deadline, or `null` to explicitly remove the
+deadline. A past timestamp is rejected, and refunded ownership cannot be
+reissued. The state transition, guest rotation, replacement license assignment,
+and reissue outbox row commit together.
+
 ### Guest notification delivery safety
 
-Guest-capability emails are delivered with a short-lived bearer token only for the
-provider hand-off. The outbox keeps a token-free checkpoint, redacts the persisted
-Medusa notification data immediately afterwards, and records the redacted send
+Guest-capability emails are delivered with a bounded-lifetime bearer token only
+for the provider hand-off. The outbox keeps a token-free checkpoint, redacts the
+persisted Medusa notification data immediately afterwards, and records the redacted send
 before marking the delivery sent. A retry revokes any previously prepared session
 before minting a new attempt-scoped session and notification idempotency key.
 

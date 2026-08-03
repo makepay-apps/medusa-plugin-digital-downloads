@@ -195,6 +195,7 @@ describe("frozen storefront DTO contract", () => {
       download_count: 1,
       customer_id: "cus_private",
       snapshot: {
+        order: { id: "order_1", display_id: 1042 },
         line_item: {
           id: "item_1",
           product_id: "prod_1",
@@ -241,6 +242,7 @@ describe("frozen storefront DTO contract", () => {
         "license",
         "line_item_id",
         "order_id",
+        "order_display_id",
         "product",
         "revoked_at",
         "status",
@@ -256,6 +258,7 @@ describe("frozen storefront DTO contract", () => {
         variant_title: "PDF",
         kind: "ebook",
       },
+      order_display_id: 1042,
       assets: [
         {
           id: "dasset_1",

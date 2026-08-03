@@ -15,6 +15,11 @@ const serverClient = () =>
       // different request's JWT.
       headers: getAuthHeaders,
     }),
+    // Required if this client returns a grant that a Store content route will
+    // consume directly. Never propagate the customer JWT into grant headers.
+    grantHeaders: {
+      "x-publishable-api-key": process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY!,
+    },
   })
 
 export async function listDigitalLibrary(limit = 20, offset = 0) {

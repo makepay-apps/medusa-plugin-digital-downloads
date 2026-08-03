@@ -100,6 +100,7 @@ environment variables, logs, or support exports.
     defaultDownloadLimit: 5,
     defaultGrantTtlSeconds: 900,
     maxGrantTtlSeconds: 86_400,
+    guestAccessTtlSeconds: 2_592_000,
     maxUploadSizeBytes: 512 * 1024 * 1024,
     allowedMimeTypes: [
       "application/pdf",
@@ -233,8 +234,12 @@ boolean conversion for `forcePathStyle`.
   the exact Admin origins, `PUT`, the returned signed headers (normally
   `content-type` and optional checksum headers), and `ETag` exposure when the
   provider requires it. Do not enable anonymous `GET` to make uploads work.
-- Prefer bucket default server-side encryption, versioning/retention matched to
-  recovery requirements, and lifecycle cleanup for abandoned staging objects.
+- Prefer bucket default server-side encryption and versioning/retention matched
+  to recovery requirements. Do not apply a blanket deletion rule to the shared
+  `uploads/` prefix: pending uploads and completed live assets retain keys in
+  that namespace. Object cleanup must be database-aware, recheck that no upload,
+  asset, release, or entitlement references the key, and use an approved safety
+  delay and retry policy.
 
 SHA-256 is checked at upload/completion and again when the immutable release
 manifest is published. Delivery validates storage size, range, status, and
@@ -273,6 +278,7 @@ public asset URL into `endpoint`.
 | `defaultDownloadLimit` | `5` | `null` means unlimited; `0` permits no logical downloads. Maximum 1,000,000. |
 | `defaultGrantTtlSeconds` | `900` | 30 seconds through 7 days. |
 | `maxGrantTtlSeconds` | `86400` | Must be at least the default and at most 7 days. |
+| `guestAccessTtlSeconds` | `2592000` (30 days) | Guest purchase-recovery capability lifetime, independently bounded from 1 day through 365 days. It is not an asset/content grant lifetime. |
 | `maxUploadSizeBytes` | 5 GiB | Runtime ceiling, up to the v1 hard maximum of 1 TiB. Upload intents/routes, Admin settings, proxies, and storage providers can impose lower limits. |
 | `allowedMimeTypes` | empty allowlist | Empty or `*/*` accepts any syntactically valid MIME; supports exact types and `type/*`. |
 | `allowGuestAccess` | `true` | Enables module guest policy; routes still validate explicit guest capabilities. |
@@ -290,10 +296,23 @@ silently pointing historical locators at a different directory or bucket.
 ## Database-managed settings
 
 The module models non-secret global settings for enabled state, default
-delivery mode, download limit, grant TTL ceiling, upload limit, guest access,
-order-email matching, audit retention, and MakePay attribution visibility.
+delivery mode, download limit, content-grant TTL ceiling, guest-access TTL,
+upload limit, guest access, order-email matching, audit retention, and MakePay
+attribution visibility.
 Runtime storage credentials and encryption/token secrets are not safe
 database-managed Admin fields.
+
+`guest_access_ttl_seconds` defaults to `2592000` (30 days) and accepts 86,400
+seconds through 31,536,000 seconds (1 through 365 days). It controls the opaque
+purchase-recovery capability delivered to a guest. It is deliberately separate
+from `default_grant_ttl_seconds` and `max_grant_ttl_seconds`, which control the
+short-lived, asset-bound capability created only after an entitlement access
+check. The effective lifetime for a newly issued guest capability is the lower
+of this persisted setting and the resolved `guestAccessTtlSeconds` module
+option. Startup narrows an upgrade-seeded 30-day row when the module option is
+shorter, and explicit session TTLs cannot exceed that effective ceiling.
+Shortening either policy does not retroactively rewrite already issued
+capabilities.
 
 `require_order_email_match` defaults to `true`. With that policy enabled, the
 guest access, guest grant, and guest license-reveal bodies must supply the order
@@ -304,8 +323,10 @@ and storefronts should prompt for the email rather than putting it in a link.
 `event_retention_days` records the merchant's retention target. Version 1 does
 not automatically purge download/license audit history at that age; implement
 an approved export/purge process for regulatory deletion requirements. The
-daily cleanup job expires capabilities and reconciles orphaned product state,
-not durable audit records.
+hourly expiry job transitions due entitlements, access checks reject expired
+capabilities inline, and the daily cleanup job reconciles orphaned product
+state. None of those jobs deletes upload objects, grants, or durable audit
+records.
 
 The attribution text and URL are fixed when present:
 [Brought to you by MakePay.io — crypto payment gateway.](https://makepay.io)
@@ -315,7 +336,34 @@ If an Admin setting and a hard module option both impose a limit, use the more
 restrictive effective value. Changing a current default must not mutate the
 immutable policy snapshot of an existing entitlement.
 
+Startup narrows persisted content-grant defaults/maximums and upload limits to
+the resolved module ceilings, and a runtime `allowGuestAccess: false` disables
+the persisted guest-access switch. Grant issuance, guest access, and every
+upload stage reapply those effective policies independently, so an outdated or
+concurrently modified settings row cannot relax the deployed runtime limits.
+
 ## Fulfillment and revocation policy
+
+### Published-release prerequisite
+
+Every digital product must have a current published release before the plugin
+can issue an entitlement. This applies to license-only products as well as
+download, stream, and mixed products. Publication verifies deliverables by
+mode:
+
+- `download` requires a ready download or manual asset;
+- `stream` requires a ready stream asset;
+- `mixed` requires ready downloadable/streamable content and an enabled
+  generated or pooled license policy;
+- `license` requires the enabled license policy but allows a published release
+  with an empty asset set.
+
+The release boundary remains necessary for license-only products because the
+entitlement snapshots an immutable purchased version and license terms. The
+publish input keeps `notify_existing_customers` for forward compatibility, but
+version 0.4 explicitly rejects `true`: existing entitlements remain pinned to
+their purchased release until supported update-policy semantics are defined.
+Use `false` (the default).
 
 Digital product configurations select `payment_captured`, `order_completed`,
 or `manual` fulfillment. The plugin also listens to `order.placed`; a
@@ -350,8 +398,12 @@ use it only with a reviewed line-aware adapter that invokes the revocation
 workflow with `line_item_ids`. It does not infer refunded items from amounts.
 
 `cancellationPolicy` defaults to `all`. For an order-cancellation trigger,
-`retain` preserves access and every other current value revokes all
-non-terminal entitlements. Chargeback/dispute signals always revoke all.
+`retain` preserves access and every other current value revokes all eligible
+entitlements. Chargeback/dispute signals always revoke all. Fulfillment and
+revocation use the same order-scoped lock. Once policy selects an order, all
+matching entitlement state changes, capability/license invalidation, and
+revocation outbox inserts commit in one module transaction; a failed insert
+rolls the entire order operation back for a clean retry.
 
 Retry schedules and maximum attempts are fixed in v1: fulfillment
 reconciliation every five minutes, notification delivery every two minutes,
@@ -398,8 +450,9 @@ fulfillment path.
 
 ### Notification Module and scheduled jobs
 
-Delivery, revocation, reissue, and expiry emails are submitted through
-Medusa's normal Notification Module using these template identifiers:
+After the host configures an email notification provider and the matching
+templates, delivery, revocation, reissue, and expiry emails are submitted
+through Medusa's normal Notification Module using these identifiers:
 
 - `digital-downloads-delivery`
 - `digital-downloads-revoked`
@@ -411,6 +464,42 @@ host application. The plugin stores recipient hashes and delivery/outbox state;
 the Notification Module remains responsible for provider credentials,
 rendering, and transport. A missing customer email leaves the notification
 undeliverable without exposing the address in operational projections.
+
+![Sanitized fixture preview of a post-purchase digital delivery email produced by a Medusa Notification Module provider](images/customer-delivery-email.jpg)
+
+The screenshot is an example host-rendered delivery template, not a bundled
+email service or fixed brand theme. The package includes a
+[copy-ready Nodemailer/SMTP provider and safe template renderer](../examples/notification-provider/README.md)
+for the four identifiers above. Adapt that example inside the host's
+Notification Module configuration and supply its optional `nodemailer`
+dependency, SMTP credentials, sender identity, branding, account URL, and
+delivery-domain controls there.
+
+Do not use Medusa's logging-only local notification provider for guest
+delivery: it serializes notification template data, which can include the
+transient guest capability, into application logs. A production provider must
+deliver that value to the intended recipient without logging or persistently
+indexing it.
+
+The plugin creates idempotent durable outbox rows for entitlement lifecycle
+notifications and submits them through the host Notification Module. A provider
+failure never rolls back ownership. Failed rows use bounded backoff and the
+two-minute retry job, reaching durable dead-letter state after eight attempts
+unless an operator resolves the underlying provider/template problem.
+
+Expiration and revocation idempotency is scoped to a lifecycle cycle. Retries
+within one cycle reuse the same outbox row, while a successful reissue followed
+by a later expiration receives a new cycle ID and notification row. Upgraded
+legacy `:expired:v1` and `:revoked:v1` rows remain authoritative for their
+original cycle and are not duplicated.
+
+The hourly job uses separate bounded budgets for due active entitlements and
+terminal lifecycle reconciliation. It finds expired, revoked, or refunded rows
+whose current cycle has no live outbox, then repairs each through a row-locked
+atomic service operation. The scan has a stable `as_of` cutoff, ignores invalid
+or non-normalized legacy recipients, and treats any non-soft-deleted matching
+delivery as authoritative regardless of delivery state. Soft-deleted outboxes
+are eligible for safe recreation under the partial unique index.
 
 For a guest delivery or guest-token rotation, the template invocation receives
 a transient `guest_access_token` and the same value as
@@ -429,8 +518,8 @@ The plugin also installs non-overlapping scheduled jobs:
 | Job | Schedule | Purpose |
 | --- | --- | --- |
 | `digital-downloads-retry-fulfillment` | every 5 minutes | Reconcile pending/failed/stale fulfillment operations, 25 at a time. |
-| `digital-downloads-retry-notifications` | every 2 minutes | Retry due notification outbox rows, 25 at a time. |
-| `digital-downloads-expire-entitlements` | hourly at minute 17 | Expire up to 500 due entitlements and enqueue notices. |
+| `digital-downloads-retry-notifications` | every 2 minutes | Retry due notification outbox rows, 10 at a time. |
+| `digital-downloads-expire-entitlements` | hourly at minute 17 | Expire up to 500 due entitlements and reconcile up to 500 missing terminal lifecycle outboxes. |
 | `digital-downloads-cleanup-orphans` | daily at `03:43` | Reconcile up to 1,000 orphaned product links/configurations. |
 
 Each job uses `concurrency: "forbid"` within Medusa's scheduler configuration,

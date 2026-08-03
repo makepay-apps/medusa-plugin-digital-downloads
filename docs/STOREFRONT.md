@@ -74,8 +74,15 @@ const client = createDigitalDownloadsClient({
     baseUrl: process.env.NEXT_PUBLIC_MEDUSA_BACKEND_URL!,
     publishableKey: process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY,
   }),
+  grantHeaders: {
+    "x-publishable-api-key": process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY!,
+  },
 })
 ```
+
+The convenience constructor wires this protected-byte header automatically.
+Low-level and custom transports declare it explicitly because transport
+headers are otherwise scoped to JSON API calls.
 
 ## Existing Medusa JavaScript SDK
 
@@ -92,6 +99,9 @@ const digitalDownloads = createDigitalDownloadsClient({
   transport: createMedusaSdkTransport(sdk.client, {
     headers: async () => getAuthHeaders(),
   }),
+  grantHeaders: {
+    "x-publishable-api-key": process.env.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY!,
+  },
 })
 ```
 
@@ -143,6 +153,13 @@ prompt for the order email and exchange the pair; fragments are not sent to the
 origin server. Do not place capabilities in query strings, analytics, React
 Server Component payloads, logs, screenshots, or persistent browser storage.
 
+The guest purchase capability is not a content grant. Its configurable
+`guest_access_ttl_seconds` lifetime defaults to 2,592,000 seconds (30 days), so
+the buyer has a bounded recovery window after email delivery. Only after that
+ownership check does the storefront request a short-lived, asset-bound
+download/stream grant, whose lifetime is governed separately by the content
+grant TTL settings. Expiry or revocation of either capability fails closed.
+
 Sensitive client calls use `cache: "no-store"`. The backend independently
 returns private/no-store response headers.
 
@@ -174,7 +191,9 @@ Library filters include `limit`, `offset`, `order_id`, `status`, `kind`, and
 
 The grant response contains a short-lived token, but the SDK does not put it in
 the URL. It normalizes the grant with an Authorization header and provides a
-safe Fetch helper:
+safe Fetch helper. `createDigitalDownloadsFetchClient` also includes its
+configured Medusa publishable key; custom clients use `grantHeaders` as shown
+above:
 
 ```ts
 import {
@@ -310,6 +329,16 @@ import {
 />
 ```
 
+![Customer account digital library with protected download, stream, and license actions](images/storefront-customer-library.jpg)
+
+Each entitlement card identifies the native Medusa order, shows only safe file
+metadata, requests a protected grant after the buyer clicks **Download** or
+**Play**, and keeps the full license key hidden until an explicit reveal
+action. The key exists only in component state after that action; do not put it
+in server-rendered HTML, analytics, URLs, or persistent browser storage.
+
+![Customer digital library showing a deliberately revealed disposable license key](images/storefront-license-revealed.jpg)
+
 The components use semantic headings, lists, native controls, live status/error
 regions, loading and empty states, and minimal markup. Use `className`, render
 callbacks, custom messages, and event callbacks to apply a storefront design.
@@ -322,6 +351,38 @@ fixed attribution by default:
 `MakePayAttribution` explicitly elsewhere. The component's destination is
 fixed to the safe HTTPS MakePay homepage.
 
+## Native account and order-history integration
+
+Keep the account-wide `DigitalLibrary` on a normal authenticated account route,
+such as `/account/downloads`. For an existing Medusa order-detail screen, use
+the order-scoped wrapper:
+
+```tsx
+import {
+  DigitalOrderDownloads,
+} from "@makecrypto/medusa-plugin-digital-downloads/storefront"
+
+<DigitalOrderDownloads
+  identityKey={customerIdentityKey}
+  orderId={order.id}
+  orderDisplayId={order.display_id}
+  onGrant={openProtectedContentThroughBff}
+/>
+```
+
+`orderId` is the internal Medusa order ID used for the Store API filter;
+`orderDisplayId` is presentation-only. `DigitalOrderDownloads` enforces its own
+`order_id` filter so optional query props cannot widen the request. Backend
+customer ownership checks remain authoritative even if a buyer changes either
+value in the browser.
+
+![Medusa customer order detail with order-scoped digital downloads and licenses](images/storefront-order-history-digital-delivery.jpg)
+
+This extends the host's native order-history/detail page; it does not introduce
+a second order database or replace Medusa account authentication. Revoked,
+refunded, expired, suspended, and download-limit states remain visible as
+history while their protected actions stay unavailable.
+
 ## Next.js starter examples
 
 Copy files from `examples/nextjs-starter` into the corresponding official
@@ -331,7 +392,10 @@ Medusa starter paths and remove the `.example` suffix. The example set includes:
 - a Store API/data helper;
 - a constrained catch-all BFF route;
 - a same-origin grant-to-HttpOnly-cookie exchange;
-- account and guest libraries;
+- an authenticated library component to mount at `/account/downloads`;
+- an order-scoped component to mount inside the existing
+  `/account/orders/details/[id]` page;
+- a guest recovery component to mount at `/digital-access`;
 - product preview integration.
 
 Set server-only `MEDUSA_BACKEND_URL` and the normal
@@ -340,6 +404,30 @@ cookie security, route prefix, and response-header forwarding for your domains
 before production use. Pass a changing non-secret customer `identityKey` to the
 provider/account library, and prompt guest buyers for their order email; keep
 both the capability and email out of the recovery-link URL.
+
+## Post-purchase email and recovery
+
+When the merchant configures the documented templates, the plugin's durable
+notification outbox submits post-purchase delivery through the host Medusa
+Notification Module. The merchant's provider owns email credentials, sender
+identity, rendering, branding, transport, suppression, and deliverability; the
+plugin does not bundle an SMTP or hosted email service.
+
+![Sanitized fixture preview of a post-purchase digital delivery email produced by a Medusa Notification Module provider](images/customer-delivery-email.jpg)
+
+The package supplies a
+[copy-ready Nodemailer/SMTP provider and safe template renderer](../examples/notification-provider/README.md).
+Use the registered-customer template to link to the normal account library or
+native order detail. For a guest delivery, create the recovery URL in the
+trusted provider template with the opaque capability in the URL fragment, not
+the query string; never include the order email in the link. The guest page
+must remove the fragment immediately, prompt for that email, and exchange both
+values through the POST-only guest API before rendering files or license
+actions.
+
+Email failure never rolls back the entitlement. The outbox retries provider or
+template failures independently; storefront ownership must always be read from
+the authenticated Store API rather than inferred from whether an email arrived.
 
 ## Error handling
 

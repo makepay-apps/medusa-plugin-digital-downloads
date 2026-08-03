@@ -185,6 +185,16 @@ run_id="$(date -u '+%Y%m%dT%H%M%SZ')-${storage_provider}-$$"
 run_root="${E2E_RUNTIME_ROOT}/${run_id}"
 mkdir "$run_root"
 chmod 700 "$run_root"
+notification_capture_root="${run_root}/notifications"
+mkdir -p \
+  "$notification_capture_root/attempts" \
+  "$notification_capture_root/captures"
+e2e_assert_fixture_descendant "$notification_capture_root" \
+  "Notification capture directory"
+chmod 700 \
+  "$notification_capture_root" \
+  "$notification_capture_root/attempts" \
+  "$notification_capture_root/captures"
 lock_entry="${lock_root}/${run_id}"
 mkdir "$lock_entry"
 
@@ -256,6 +266,8 @@ apply_backend_env() {
   export JWT_SECRET="$FIXTURE_JWT_SECRET"
   export COOKIE_SECRET="$FIXTURE_COOKIE_SECRET"
   export DIGITAL_DOWNLOADS_E2E="1"
+  export E2E_FIXTURE_ROOT
+  export E2E_NOTIFICATION_CAPTURE_ROOT="$notification_capture_root"
   export DIGITAL_DOWNLOADS_E2E_STORAGE_PROVIDER="$storage_provider"
   export DIGITAL_DOWNLOADS_LOCAL_ROOT="$FIXTURE_DIGITAL_DOWNLOADS_LOCAL_ROOT"
   export DIGITAL_DOWNLOADS_TOKEN_SECRET="$FIXTURE_DIGITAL_DOWNLOADS_TOKEN_SECRET"
@@ -292,6 +304,9 @@ apply_minio_env() {
 
 apply_storefront_env() {
   export NODE_ENV="production"
+  export DIGITAL_DOWNLOADS_E2E="1"
+  export E2E_FIXTURE_ROOT
+  export E2E_NOTIFICATION_CAPTURE_ROOT="$notification_capture_root"
   export NEXT_PUBLIC_MEDUSA_BACKEND_URL="http://127.0.0.1:9100"
   export NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY="$FIXTURE_NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY"
   export NEXT_PUBLIC_DEFAULT_REGION="$FIXTURE_NEXT_PUBLIC_DEFAULT_REGION"
@@ -308,6 +323,7 @@ apply_lifecycle_env() {
   export E2E_PUBLISHABLE_KEY="$FIXTURE_NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY"
   export E2E_RUN_ID="$run_id"
   export E2E_RESULT_PATH="$run_root/result.json"
+  export E2E_NOTIFICATION_CAPTURE_ROOT="$notification_capture_root"
   export E2E_BRIDGE_SCRIPT="$SCRIPT_ROOT/fixture-bridge.ts"
   export E2E_ADMIN_EMAIL="$FIXTURE_E2E_ADMIN_EMAIL"
   export E2E_ADMIN_PASSWORD="$FIXTURE_E2E_ADMIN_PASSWORD"
@@ -317,7 +333,7 @@ e2e_log "Preflight: dedicated PostgreSQL, ports, and fixture paths"
 pg_isready --dbname="$FIXTURE_DATABASE_URL" >/dev/null 2>&1 || \
   e2e_die "Dedicated PostgreSQL fixture is unavailable on port 55432"
 
-e2e_log "Validating and installing the packed v1 artifact"
+e2e_log "Validating and installing the packed v0.4.0 artifact"
 configure_args=("$tarball")
 if [[ "$run_storefront" != "true" ]]; then
   configure_args+=("--skip-storefront")
@@ -429,7 +445,7 @@ if [[ "$run_storefront" == "true" ]]; then
   seal_process_identity "storefront" "$storefront_pid"
 fi
 
-e2e_log "Running real Admin/Store purchase, delivery, license, guest, refund, and cancellation lifecycle"
+e2e_log "Running purchase, email, retry, delivery, license, guest, refund, cancellation, and showcase lifecycle"
 (
   apply_lifecycle_env
   e2e_run_bounded 900 node "$SCRIPT_ROOT/lifecycle.mjs"
@@ -444,27 +460,103 @@ curl --fail --silent --show-error --location --max-time 15 \
 if [[ "$run_storefront" == "true" ]]; then
   product_handle="$(node -e 'const value=require(process.argv[1]); process.stdout.write(value.resources.product_handle)' "$run_root/result.json")"
   variant_id="$(node -e 'const value=require(process.argv[1]); process.stdout.write(value.resources.variant_id)' "$run_root/result.json")"
+  showcase_order_id="$(node -e 'const value=require(process.argv[1]); process.stdout.write(value.resources.showcase_order_id)' "$run_root/result.json")"
+  showcase_receipt="$(node -e 'const value=require(process.argv[1]); process.stdout.write(value.resources.showcase_credentials_receipt)' "$run_root/result.json")"
   [[ "$product_handle" =~ ^[a-z0-9-]+$ ]] || e2e_die "Lifecycle returned an invalid product handle"
   [[ "$variant_id" =~ ^[A-Za-z0-9_.:-]+$ ]] || e2e_die "Lifecycle returned an invalid variant ID"
+  [[ "$showcase_order_id" =~ ^[A-Za-z0-9_.:-]+$ ]] || \
+    e2e_die "Lifecycle returned an invalid showcase order ID"
+  [[ "$showcase_receipt" == "showcase-credentials.json" ]] || \
+    e2e_die "Lifecycle returned an unexpected showcase receipt name"
+  e2e_require_file "$run_root/$showcase_receipt"
+  [[ ! -L "$run_root/$showcase_receipt" ]] || \
+    e2e_die "Showcase credentials receipt must not be a symlink"
+  node -e '
+    const fs = require("node:fs")
+    const value = require(process.argv[1])
+    const receipt = require(process.argv[2])
+    const mode = fs.statSync(process.argv[2]).mode & 0o777
+    if (mode & 0o077) throw new Error("showcase receipt is not mode 0600")
+    if (value.schema_version !== 2 || value.status !== "passed") throw new Error("lifecycle evidence is incomplete")
+    if (value.assertions.registered_delivery_notifications_sent !== 2) throw new Error("registered delivery evidence is incomplete")
+    if (value.assertions.guest_delivery_notifications_sent !== 1) throw new Error("guest delivery evidence is incomplete")
+    if (value.assertions.notification_retry_attempts !== 2) throw new Error("retry evidence is incomplete")
+    if (value.assertions.provider_rendered_email_html !== true) throw new Error("provider HTML evidence is incomplete")
+    if (value.assertions.guest_capability_consumed_from_provider !== true) throw new Error("guest provider-boundary evidence is incomplete")
+    if (value.assertions.retained_notification_captures_secret_free !== true) throw new Error("notification cleanup evidence is incomplete")
+    if (value.assertions.showcase_entitlement_active !== true) throw new Error("showcase entitlement evidence is incomplete")
+    const evidenceText = fs.readFileSync(process.argv[1], "utf8")
+    if (/(?:dda|ddg|ddu)_[A-Za-z0-9._~-]{20,}|"(?:customer_password|guest_access_token|license_key|token)"\s*:/.test(evidenceText)) {
+      throw new Error("lifecycle evidence contains a raw credential or capability")
+    }
+    if (receipt.order_id !== value.resources.showcase_order_id || !receipt.customer_email || !receipt.customer_password) {
+      throw new Error("showcase receipt does not match lifecycle evidence")
+    }
+  ' "$run_root/result.json" "$run_root/$showcase_receipt" || \
+    e2e_die "Private showcase receipt or notification evidence validation failed"
   curl --fail --silent --show-error --location --max-time 30 \
     "http://127.0.0.1:8000/dk/products/${product_handle}" >/dev/null
-  curl --fail --silent --show-error --location --max-time 30 \
-    "http://127.0.0.1:8000/dk/digital-downloads-e2e?variant_id=${variant_id}" \
+  curl --fail --silent --show-error --location --max-time 30 --get \
+    --data-urlencode "variant_id=${variant_id}" \
+    --data-urlencode "order_id=${showcase_order_id}" \
+    "http://127.0.0.1:8000/dk/digital-downloads-e2e" \
     >"$run_root/storefront-consumer.html"
   chmod 600 "$run_root/storefront-consumer.html"
-  rg -q 'data-packed-digital-downloads-storefront="v1"' \
+  rg -q 'data-packed-digital-downloads-storefront="v2"' \
     "$run_root/storefront-consumer.html" || \
     e2e_die "Packed storefront consumer route did not render"
   rg -q 'data-makepay-attribution' "$run_root/storefront-consumer.html" || \
     e2e_die "Packed storefront attribution component did not render"
-  rg -q 'download,license,stream' "$run_root/storefront-consumer.html" || \
-    e2e_die "Packed storefront client did not render the live delivery projection"
+  rg -q 'data-testid="customer-login"' "$run_root/storefront-consumer.html" || \
+    e2e_die "Packed storefront customer login did not render"
+  rg -q 'Your downloads and licenses' "$run_root/storefront-consumer.html" || \
+    e2e_die "Packed storefront customer delivery shell did not render"
+  email_preview_status="$(
+    curl --silent --show-error --max-time 15 --get \
+      --data-urlencode "order_id=${showcase_order_id}" \
+      --output "$run_root/email-preview-unauthenticated.json" \
+      --write-out '%{http_code}' \
+      "http://127.0.0.1:8000/api/digital-downloads-e2e/email-preview"
+  )"
+  chmod 600 "$run_root/email-preview-unauthenticated.json"
+  [[ "$email_preview_status" == "401" ]] || \
+    e2e_die "Fixture email preview must reject unauthenticated requests"
+  node -e '
+    const fs = require("node:fs")
+    const path = require("node:path")
+    const runRoot = fs.realpathSync(process.argv[1])
+    const receiptPath = fs.realpathSync(process.argv[2])
+    const receipt = require(receiptPath)
+    const capability = /(?:dda|ddg|ddu)_[A-Za-z0-9._~-]{20,}/
+    const visit = (directory) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const candidate = path.join(directory, entry.name)
+        const info = fs.lstatSync(candidate)
+        if (info.isSymbolicLink()) throw new Error("private run evidence contains a symlink")
+        if (entry.isDirectory()) {
+          visit(candidate)
+          continue
+        }
+        if (!entry.isFile() || fs.realpathSync(candidate) === receiptPath) continue
+        if (info.size > 16 * 1024 * 1024 || /\.tgz$/.test(entry.name)) continue
+        const text = fs.readFileSync(candidate, "utf8")
+        if (text.includes(receipt.customer_password) || capability.test(text)) {
+          throw new Error(`private run artifact leaked a raw credential: ${path.relative(runRoot, candidate)}`)
+        }
+      }
+    }
+    visit(runRoot)
+  ' "$run_root" "$run_root/$showcase_receipt" || \
+    e2e_die "Private run artifacts contain a raw showcase credential or bearer capability"
 fi
 
 if [[ "$keep_running" == "true" ]]; then
   trap - EXIT INT TERM
   e2e_log "PASS. Fixture services remain available for browser E2E."
   e2e_log "Run directory: ${run_root}"
+  if [[ "$run_storefront" == "true" ]]; then
+    e2e_log "Private browser credentials: ${run_root}/showcase-credentials.json"
+  fi
   e2e_log "Stop safely with the same E2E_FIXTURE_ROOT: ${SCRIPT_ROOT}/stop-fixture.sh ${run_root}"
 else
   e2e_log "PASS. Evidence: ${run_root}/result.json"
